@@ -1,0 +1,61 @@
+electrode_generation:
+  source:
+    mpid: mp-19017
+    pristine_structure_path: null
+    target_ion: Li
+    supercell: [3, 3, 3]
+
+  output:
+    output_dir: ./electrode_structures
+    output_format: poscar
+
+  sampling:
+    max_structures: 600
+    oversampling_factor: 10
+    min_lithiation_fraction: 0.75
+    lithiation_step: 0.05
+    max_removal_combinations_per_fraction: 200
+    rattle_method: mc
+    rattles_per_structure: 1
+    rattle_std_300k: 0.01
+    rattle_d_min: 1.5
+    rattle_n_iter: 10
+    max_base_structures_per_bin: 25
+    phonon_fc2_path: null
+    phonon_qm_statistics: false
+    phonon_imag_freq_factor: 1.0
+
+  temperature:
+    strategy: fixed
+    values: [250, 300, 600, 900, 1200]
+    auto:
+      n_points: 5
+      include_300k: true
+      melting_temperature_margin: 1.1
+
+  ratios:
+    removal_vs_rattle:
+      removal_combinations_fraction: 0.20
+      rattled_variants_fraction: 0.80
+    removal_strategy_weights:
+      symmetry_unique: 0.35
+      random_uniform: 0.35
+      dispersed_vacancies: 0.20
+      clustered_vacancies: 0.10
+    retention:
+      temperature_weights:
+        "250": 0.15
+        "300": 0.35
+        "600": 0.25
+        "900": 0.15
+        "1200": 0.10
+      lithiation_bin_weights:
+        "1.00-0.95": 0.30
+        "0.95-0.90": 0.25
+        "0.90-0.85": 0.20
+        "0.85-0.80": 0.15
+        "0.80-0.75": 0.10
+
+electrolyte_example:
+  solvent: H2O
+  hydroxides: [LiOH, NaOH]

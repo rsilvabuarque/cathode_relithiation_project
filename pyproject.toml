@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydrothermal-relithiation-workflows"
+version = "0.1.0"
+description = "Computational workflows for hydrothermal cathode relithiation experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+electrode-generation = [
+  "ase",
+  "pymatgen",
+  "hiphive",
+  "numpy",
+]
+dev = [
+  "pytest",
+  "ruff",
+  "mypy",
+]
+
+[project.scripts]
+hrw = "hydrorelith.cli:main"
+hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
