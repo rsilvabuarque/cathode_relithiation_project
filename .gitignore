@@ -10,3 +10,6 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+
+for_chat_gpt/
+results/dry_run_engine_all_*/
