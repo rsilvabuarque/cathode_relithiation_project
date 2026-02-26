@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
-os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
@@ -55,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rattle-method", choices=["mc", "gaussian", "phonon"], default="mc")
     parser.add_argument(
         "--rattle-engine",
-        choices=["hiphive", "uma", "m3gnet", "all"],
+        choices=["hiphive", "uma", "matgl", "all"],
         default="hiphive",
     )
     parser.add_argument(
@@ -73,10 +71,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uma-task-id", type=str, default="omat")
     parser.add_argument("--uma-device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument(
-        "--m3gnet-device",
-        choices=["cpu", "auto"],
-        default="cpu",
-        help="Use CPU by default for robust portability; set 'auto' to allow TensorFlow GPU discovery.",
+        "--matgl-model-name",
+        type=str,
+        default="CHGNet-MatPES-PBE-2025.2.10-2.7M-PES",
+        help="MatGL pretrained potential to use for MD-based rattling.",
+    )
+    parser.add_argument(
+        "--matgl-backend",
+        choices=["auto", "dgl", "pyg"],
+        default="dgl",
+        help="MatGL backend. Use DGL for CHGNet/QET models.",
     )
     parser.add_argument("--rattles-per-structure", type=int, default=1)
     parser.add_argument("--rattle-std-300k", type=float, default=0.01)
@@ -161,7 +165,8 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.uma_model_name = args.uma_model_name
     config.sampling.uma_task_id = args.uma_task_id
     config.sampling.uma_device = args.uma_device
-    config.sampling.m3gnet_device = args.m3gnet_device
+    config.sampling.matgl_model_name = args.matgl_model_name
+    config.sampling.matgl_backend = args.matgl_backend
     config.sampling.rattle_method = args.rattle_method
     config.sampling.rattles_per_structure = args.rattles_per_structure
     config.sampling.rattle_std_300k = args.rattle_std_300k
@@ -209,7 +214,7 @@ class ElectrodeStructureGenerationPipeline:
             self.write_structures(delithiation_candidates)
             return
 
-        if getattr(self, "slurm_generate_only", False) and self.config.sampling.rattle_engine in {"uma", "m3gnet", "all"}:
+        if getattr(self, "slurm_generate_only", False) and self.config.sampling.rattle_engine in {"uma", "matgl", "all"}:
             self.write_structures(delithiation_candidates)
             self.generate_slurm_files(target_temperatures, delithiation_candidates)
             return
@@ -348,6 +353,8 @@ class ElectrodeStructureGenerationPipeline:
                 "uma_model_name": self.config.sampling.uma_model_name,
                 "uma_task_id": self.config.sampling.uma_task_id,
                 "uma_device": self.config.sampling.uma_device,
+                "matgl_model_name": self.config.sampling.matgl_model_name,
+                "matgl_backend": self.config.sampling.matgl_backend,
                 "rattle_method": self.config.sampling.rattle_method,
                 "rattles_per_structure": self.config.sampling.rattles_per_structure,
                 "rattle_std_300k": self.config.sampling.rattle_std_300k,
@@ -462,7 +469,7 @@ class ElectrodeStructureGenerationPipeline:
     def _planned_engine_targets(self, total_target_count: int) -> dict[str, int]:
         engine = self.config.sampling.rattle_engine
         if engine == "all":
-            return self._split_counts(["hiphive", "uma", "m3gnet"], total_target_count)
+            return self._split_counts(["hiphive", "uma", "matgl"], total_target_count)
         return {engine: total_target_count}
 
     def _planned_bin_targets(
@@ -619,14 +626,14 @@ class ElectrodeStructureGenerationPipeline:
             return self._generate_rattled_candidates_hiphive(structures, temperatures, target_count)
         if engine == "uma":
             return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="uma")
-        if engine == "m3gnet":
-            return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="m3gnet")
+        if engine == "matgl":
+            return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="matgl")
         if engine == "all":
-            counts = self._split_counts(["hiphive", "uma", "m3gnet"], target_count)
+            counts = self._split_counts(["hiphive", "uma", "matgl"], target_count)
             combined: list[GeneratedStructure] = []
             combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, counts["hiphive"]))
             combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["uma"], backend="uma"))
-            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["m3gnet"], backend="m3gnet"))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["matgl"], backend="matgl"))
             return combined
 
         raise ValueError(f"Unsupported rattle engine: {engine}")
@@ -850,8 +857,8 @@ class ElectrodeStructureGenerationPipeline:
                                 seed,
                                 progress_callback=_progress_callback,
                             )
-                        elif backend == "m3gnet":
-                            snapshots = self._run_m3gnet_md_snapshots(
+                        elif backend == "matgl":
+                            snapshots = self._run_matgl_md_snapshots(
                                 atoms,
                                 temperature,
                                 n_structures,
@@ -967,24 +974,29 @@ class ElectrodeStructureGenerationPipeline:
         dyn.run(steps=n_steps)
         return self._select_even_snapshots(snapshots, n_structures)
 
-    def _run_m3gnet_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
-        self._ensure_m3gnet_compatibility()
+    def _run_matgl_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+        import matgl
         from ase.io.trajectory import Trajectory
-        from m3gnet.models import MolecularDynamics
+        from matgl.ext.ase import MolecularDynamics
+
+        self._ensure_matgl_backend(matgl)
+        potential = self._load_matgl_potential(matgl)
 
         del seed
         tmp_dir = self.config.output.output_dir / "_tmp_md"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         token = random.randint(10_000, 99_999)
-        traj_path = tmp_dir / f"m3gnet_T{temperature}_{token}.traj"
-        log_path = tmp_dir / f"m3gnet_T{temperature}_{token}.log"
+        traj_path = tmp_dir / f"matgl_T{temperature}_{token}.traj"
+        log_path = tmp_dir / f"matgl_T{temperature}_{token}.log"
 
         n_steps = max(self.config.sampling.md_steps, n_structures * self.config.sampling.md_sample_interval)
         md = MolecularDynamics(
             atoms=atoms.copy(),
+            potential=potential,
             ensemble=self.config.sampling.md_ensemble,
             temperature=float(temperature),
             timestep=float(self.config.sampling.md_timestep_fs),
+            friction=float(self.config.sampling.md_friction_per_fs),
             trajectory=str(traj_path),
             logfile=str(log_path),
             loginterval=int(self.config.sampling.md_sample_interval),
@@ -1011,17 +1023,35 @@ class ElectrodeStructureGenerationPipeline:
 
         return self._select_even_snapshots(snapshots, n_structures)
 
-    def _ensure_m3gnet_compatibility(self) -> None:
-        os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-        if self.config.sampling.m3gnet_device == "cpu":
-            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+    def _ensure_matgl_backend(self, matgl_module) -> None:
+        backend_setting = self.config.sampling.matgl_backend.lower()
+        model_name = self.config.sampling.matgl_model_name
+
+        if backend_setting == "auto":
+            backend_setting = "dgl" if any(
+                token in model_name
+                for token in ("CHGNet", "QET", "TensorNetDGL")
+            ) else "pyg"
+
+        matgl_module.set_backend(backend_setting.upper())
+
+    def _load_matgl_potential(self, matgl_module):
+        if hasattr(self, "_matgl_potential") and self._matgl_potential is not None:
+            return self._matgl_potential
+
+        model_name = self.config.sampling.matgl_model_name
         try:
-            import tf_keras  # noqa: F401
+            self._matgl_potential = matgl_module.load_model(model_name)
+            return self._matgl_potential
         except Exception as exc:
-            raise RuntimeError(
-                "M3GNet backend requires legacy tf.keras compatibility. Install `tf-keras` "
-                "(matching TensorFlow major/minor), e.g. `pip install tf-keras`, then rerun."
-            ) from exc
+            message = str(exc)
+            if "Bad serialized model or bad model name" in message:
+                raise RuntimeError(
+                    f"Failed to load MatGL model '{model_name}'. Ensure the model name is valid, "
+                    "the selected backend matches the model (DGL required for CHGNet/QET), and clear stale cache with "
+                    "`python -c 'import matgl; matgl.clear_cache()'` if needed."
+                ) from exc
+            raise
 
     def _select_even_snapshots(self, snapshots, n_keep: int):
         if len(snapshots) <= n_keep:
@@ -1194,9 +1224,9 @@ class ElectrodeStructureGenerationPipeline:
 
         engines = [self.config.sampling.rattle_engine]
         if self.config.sampling.rattle_engine == "all":
-            engines = ["hiphive", "uma", "m3gnet"]
+            engines = ["hiphive", "uma", "matgl"]
 
-        md_engines = [engine for engine in engines if engine in {"uma", "m3gnet"}]
+        md_engines = [engine for engine in engines if engine in {"uma", "matgl"}]
 
         allocation = getattr(self, "slurm_allocation", None)
         mode = getattr(self, "slurm_mode", "cpu")
@@ -1212,6 +1242,20 @@ class ElectrodeStructureGenerationPipeline:
 
         split_jobs = not bool(getattr(self, "slurm_combined_jobs", False))
 
+        def _md_backend_args(engine_name: str) -> str:
+            if engine_name == "uma":
+                return (
+                    f" --uma-model-name {self.config.sampling.uma_model_name}"
+                    f" --uma-task-id {self.config.sampling.uma_task_id}"
+                    f" --uma-device {self.config.sampling.uma_device}"
+                )
+            if engine_name == "matgl":
+                return (
+                    f" --matgl-model-name {self.config.sampling.matgl_model_name}"
+                    f" --matgl-backend {self.config.sampling.matgl_backend}"
+                )
+            return ""
+
         if split_jobs:
             for engine in md_engines:
                 for temperature, lith in bins:
@@ -1226,6 +1270,7 @@ class ElectrodeStructureGenerationPipeline:
                         f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
                         f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                         f"--rattle-engine {engine} --md-execution run --skip-direct "
+                        f"{_md_backend_args(engine)} "
                         f"--only-temperature {temperature} --only-lithiation-fraction {lith:.8f} "
                         f"--target-rattle-count {per_bin} --temperatures {' '.join(str(t) for t in temperatures)}"
                     )
@@ -1242,6 +1287,7 @@ class ElectrodeStructureGenerationPipeline:
                     f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
                     f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                     f"--rattle-engine {engine} --md-execution run --skip-direct "
+                    f"{_md_backend_args(engine)} "
                     f"--temperatures {' '.join(str(t) for t in temperatures)}"
                 )
                 script_path.write_text(f"{header}\n{cmd}\n", encoding="utf-8")

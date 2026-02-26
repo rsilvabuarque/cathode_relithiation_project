@@ -12,7 +12,7 @@ Rattling can be performed with three alternatives:
 
 - hiPhive (gaussian / MC / phonon-rattle)
 - UMA MLFF molecular dynamics (`fairchem`, `omat` default task)
-- M3GNet MLFF molecular dynamics
+- MatGL MLFF molecular dynamics (`CHGNet-MatPES-PBE-2025.2.10-2.7M-PES` default model)
 
 ## Defaults for hydrothermal relithiation
 
@@ -50,7 +50,7 @@ Rationale:
 - Resolve temperature list from fixed/auto strategy.
 - Build delithiation targets and removal combinations.
 - Generate rattled candidates (phonon-rattle preferred for hiPhive).
-- Generate MD-rattled candidates with UMA/M3GNet as alternatives.
+- Generate MD-rattled candidates with UMA/MatGL as alternatives.
 - Apply DIRECT-style sampler (maml interface) under retention constraints.
 - Emit DIRECT quality plots (PCA coverage and feature coverage scores).
 - Export structures into temperature/lithiation directory tree.

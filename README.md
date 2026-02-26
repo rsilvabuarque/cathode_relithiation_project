@@ -25,7 +25,7 @@ This commit provides **backbone infrastructure only** and a detailed scaffold fo
 - Default hydrothermal-oriented sampling ratios and retention policies.
 - DIRECT subset selection placeholder.
 
-Current executable stage includes pristine loading (MPID/local), delithiation candidate generation, rattling via hiPhive or MLFF-MD (UMA/M3GNet), and DIRECT selection with plotting outputs.
+Current executable stage includes pristine loading (MPID/local), delithiation candidate generation, rattling via hiPhive or MLFF-MD (UMA/MatGL), and DIRECT selection with plotting outputs.
 
 ## Repository layout
 
@@ -66,7 +66,7 @@ Inputs accepted by the scaffold:
 - Minimum lithiation fraction (default `0.75`)
 - Lithiation step for planned bins (default `0.05`)
 - Maximum random ion-removal combinations per lithiation bin (default `200`)
-- Rattle engine (`hiphive`, `uma`, `m3gnet`, or `all`; default `hiphive`)
+- Rattle engine (`hiphive`, `uma`, `matgl`, or `all`; default `hiphive`)
 - For `hiphive`, rattle method (`mc`, `gaussian`, or `phonon`, default `mc`)
 - Rattles per base structure (default `1`)
 - Rattle amplitude at 300 K (default `0.01`, scales as $\sqrt{T/300}$)
@@ -74,8 +74,8 @@ Inputs accepted by the scaffold:
 - MC iterations (`n_iter`, default `10`)
 - Optional phonon-rattle mode (`rattle_method=phonon`) if `phonon_fc2_path` is provided
 - Per-temperature and per-lithiation progress bars during rattling
-- MLFF-MD options for UMA (`fairchem`) and M3GNet with NVT/NPT controls
-- M3GNet device policy (`--m3gnet-device cpu|auto`, default `cpu` for portability)
+- MLFF-MD options for UMA (`fairchem`) and MatGL with NVT/NPT controls
+- MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
 - Temperature strategy:
   - Fixed list default: `[250, 300, 600, 900, 1200]` K
@@ -87,7 +87,7 @@ Generation strategy:
 - Generate delithiation combinations down to the minimum lithiation with capped, fast random sampling.
 - Use one representative for 100% lithiated and single-vacancy states.
 - Oversample pool by default to `10x` final target.
-- Apply rattling via selected engine: hiPhive, UMA MD, M3GNet MD, or all three.
+- Apply rattling via selected engine: hiPhive, UMA MD, MatGL MD, or all three.
 - Apply `maml`-style DIRECT sampling to down-select robust training structures.
 - Use `--skip-direct` if you need to emit the full pre-DIRECT pool.
 - Preserve user-defined sampling ratios across lithiation bins and temperature bins.
@@ -114,12 +114,12 @@ This file includes:
 - planned rattled structure counts per method/backend
 - planned per-bin counts by temperature and lithiation fraction
 
-Real-time MD progress/ETA outputs (updated during UMA/M3GNet runs):
+Real-time MD progress/ETA outputs (updated during UMA/MatGL runs):
 
 ```text
 <output_dir>/md_runtime_stats/
 ├── md_progress_uma.json
-└── md_progress_m3gnet.json
+└── md_progress_matgl.json
 ```
 
 These files track completed structures, current bin progress, effective generation rate, ETA to completion, and failure state (`status=failed`, `error_message`) if an MD backend exits with an exception.
@@ -129,10 +129,10 @@ If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written und
 ```text
 <output_dir>/slurm_jobs/
 ├── run_uma_T<temp>_lith_<percent>.slurm
-├── run_m3gnet_T<temp>_lith_<percent>.slurm
+├── run_matgl_T<temp>_lith_<percent>.slurm
 ├── ... (one script per MD temperature × lithiation bin by default)
 ├── run_uma_rattling.slurm (when `--slurm-combined-jobs` is passed)
-├── run_m3gnet_rattling.slurm (when `--slurm-combined-jobs` is passed)
+├── run_matgl_rattling.slurm (when `--slurm-combined-jobs` is passed)
 └── plot_direct_metrics.slurm
 ```
 
@@ -176,13 +176,30 @@ hrw --help
 hrw-electrode-generate --help
 ```
 
+Recommended clean install path for UMA + MatGL:
+
+```bash
+python -m pip install fairchem-core matgl
+# Install a DGL wheel matching your torch/CUDA stack for CHGNet/QET models.
+# Example from MatGL docs (adjust for your torch/CUDA):
+python -m pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+python -m pip install -e .
+```
+
 For MPID-based structure loading, set `MP_API_KEY` in your environment.
 
-M3GNet compatibility note:
+MatGL/UMA model note:
 
-- The package pins a compatible TensorFlow + `tf-keras` stack and sets `TF_USE_LEGACY_KERAS=1` in the pipeline to avoid Keras 3 model-format mismatches when loading default M3GNet weights.
-- M3GNet defaults to CPU execution (`--m3gnet-device cpu`) to avoid CUDA/libdevice runtime issues in environments without a full CUDA toolkit setup; use `--m3gnet-device auto` when GPU TensorFlow runtime is configured correctly.
-- If an environment was created before these constraints, refresh dependencies with a clean reinstall (`pip install -e . --upgrade --force-reinstall`).
+MatGL and UMA recommended defaults:
+
+- Electrode generation: MatGL `CHGNet-MatPES-PBE-2025.2.10-2.7M-PES` and UMA task `omat`.
+- Electrolyte generation: MatGL `QET-MatQ-PES` and UMA task `omol`.
+
+MatGL installation note (important for CHGNet/QET):
+
+- CHGNet and QET are DGL-backed in MatGL, so install DGL in your environment and use `--matgl-backend dgl`.
+- MatGL v2 defaults to PyG; DGL-backed models require backend selection via `MATGL_BACKEND=DGL` or `matgl.set_backend("DGL")` (the pipeline sets this automatically from `--matgl-backend`).
+- Follow MatGL's installation guidance to choose a DGL wheel that matches your Torch/CUDA stack.
 
 Run only the implemented next stage (pristine loading + delithiation generation):
 

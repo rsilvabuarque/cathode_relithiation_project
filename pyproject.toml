@@ -9,7 +9,7 @@ description = "Computational workflows for hydrothermal cathode relithiation exp
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "numpy",
+  "numpy<2",
   "scikit-learn>=1.6.1",
   "matplotlib",
   "tqdm",
@@ -17,15 +17,16 @@ dependencies = [
   "pymatgen",
   "hiphive",
   "fairchem-core",
-  "tensorflow>=2.16,<2.21",
-  "tf-keras>=2.16,<2.21",
-  "protobuf<6",
-  "m3gnet",
+  "matgl>=2.0.0",
+  "torch>=2.2,<2.4",
 ]
 
 [project.optional-dependencies]
 electrode-generation = [
   "maml",
+]
+matgl-dgl = [
+  "dgl>=2.2.0",
 ]
 dev = [
   "pytest",
