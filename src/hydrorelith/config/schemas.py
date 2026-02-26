@@ -44,6 +44,7 @@ class SamplingConfig:
     uma_model_name: str = "uma-s-1p1"
     uma_task_id: str = "omat"
     uma_device: str = "cuda"
+    m3gnet_device: str = "cpu"
     direct_threshold_init: float = 0.05
     direct_plot_metrics: bool = True
 

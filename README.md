@@ -75,6 +75,7 @@ Inputs accepted by the scaffold:
 - Optional phonon-rattle mode (`rattle_method=phonon`) if `phonon_fc2_path` is provided
 - Per-temperature and per-lithiation progress bars during rattling
 - MLFF-MD options for UMA (`fairchem`) and M3GNet with NVT/NPT controls
+- M3GNet device policy (`--m3gnet-device cpu|auto`, default `cpu` for portability)
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
 - Temperature strategy:
   - Fixed list default: `[250, 300, 600, 900, 1200]` K
@@ -176,6 +177,12 @@ hrw-electrode-generate --help
 ```
 
 For MPID-based structure loading, set `MP_API_KEY` in your environment.
+
+M3GNet compatibility note:
+
+- The package pins a compatible TensorFlow + `tf-keras` stack and sets `TF_USE_LEGACY_KERAS=1` in the pipeline to avoid Keras 3 model-format mismatches when loading default M3GNet weights.
+- M3GNet defaults to CPU execution (`--m3gnet-device cpu`) to avoid CUDA/libdevice runtime issues in environments without a full CUDA toolkit setup; use `--m3gnet-device auto` when GPU TensorFlow runtime is configured correctly.
+- If an environment was created before these constraints, refresh dependencies with a clean reinstall (`pip install -e . --upgrade --force-reinstall`).
 
 Run only the implemented next stage (pristine loading + delithiation generation):
 

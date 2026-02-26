@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
@@ -70,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uma-model-name", type=str, default="uma-s-1p1")
     parser.add_argument("--uma-task-id", type=str, default="omat")
     parser.add_argument("--uma-device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--m3gnet-device",
+        choices=["cpu", "auto"],
+        default="cpu",
+        help="Use CPU by default for robust portability; set 'auto' to allow TensorFlow GPU discovery.",
+    )
     parser.add_argument("--rattles-per-structure", type=int, default=1)
     parser.add_argument("--rattle-std-300k", type=float, default=0.01)
     parser.add_argument("--rattle-d-min", type=float, default=1.5)
@@ -153,6 +161,7 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.uma_model_name = args.uma_model_name
     config.sampling.uma_task_id = args.uma_task_id
     config.sampling.uma_device = args.uma_device
+    config.sampling.m3gnet_device = args.m3gnet_device
     config.sampling.rattle_method = args.rattle_method
     config.sampling.rattles_per_structure = args.rattles_per_structure
     config.sampling.rattle_std_300k = args.rattle_std_300k
@@ -959,6 +968,7 @@ class ElectrodeStructureGenerationPipeline:
         return self._select_even_snapshots(snapshots, n_structures)
 
     def _run_m3gnet_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+        self._ensure_m3gnet_compatibility()
         from ase.io.trajectory import Trajectory
         from m3gnet.models import MolecularDynamics
 
@@ -1000,6 +1010,18 @@ class ElectrodeStructureGenerationPipeline:
             snapshots = [frame.copy() for frame in traj]
 
         return self._select_even_snapshots(snapshots, n_structures)
+
+    def _ensure_m3gnet_compatibility(self) -> None:
+        os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+        if self.config.sampling.m3gnet_device == "cpu":
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+        try:
+            import tf_keras  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "M3GNet backend requires legacy tf.keras compatibility. Install `tf-keras` "
+                "(matching TensorFlow major/minor), e.g. `pip install tf-keras`, then rerun."
+            ) from exc
 
     def _select_even_snapshots(self, snapshots, n_keep: int):
         if len(snapshots) <= n_keep:

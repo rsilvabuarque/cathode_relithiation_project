@@ -25,6 +25,7 @@ electrode_generation:
     uma_model_name: uma-s-1p1
     uma_task_id: omat
     uma_device: cuda
+    m3gnet_device: cpu
     rattle_method: mc
     rattles_per_structure: 1
     rattle_std_300k: 0.01
