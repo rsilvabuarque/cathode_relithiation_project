@@ -11,8 +11,54 @@ Create a robust and diverse training set for electrode MLFF models by combining:
 Rattling can be performed with three alternatives:
 
 - hiPhive (gaussian / MC / phonon-rattle)
-- UMA MLFF molecular dynamics (`fairchem`, `omat` default task)
+- UMA MLFF molecular dynamics (`fairchem-core>=2.15.0`, `omat` default task)
 - MatGL MLFF molecular dynamics (`CHGNet-MatPES-PBE-2025.2.10-2.7M-PES` default model)
+
+## Current implementation defaults
+
+The list below reflects the active defaults in `SamplingConfig` and pipeline CLI wiring.
+
+- Source and output:
+  - target ion: `Li`
+  - supercell: `(3, 3, 3)`
+  - output format: `poscar`
+- Core sampling:
+  - final structures: `600`
+  - oversampling factor: `10`
+  - minimum lithiation fraction: `0.75`
+  - lithiation step: `0.05`
+  - max removal combinations per fraction: `200`
+- hiPhive rattling:
+  - rattle method: `mc`
+  - rattles per base structure: `1`
+  - rattle std at 300 K: `0.01`
+  - `d_min`: `1.5`
+  - `n_iter`: `10`
+  - max base structures per temperature/lithiation bin: `25`
+  - phonon options: `phonon_fc2_path=None`, `phonon_qm_statistics=False`, `phonon_imag_freq_factor=1.0`
+- MLFF-MD execution:
+  - rattle engine default: `hiphive`
+  - md execution mode: `run`
+  - ensemble: `nvt`
+  - timestep: `1.0 fs`
+  - steps: `500`
+  - sample interval: `10`
+  - Langevin friction: `0.001 / fs`
+  - UMA model/device/task: `uma-s-1p1`, `cuda`, `omat`
+  - MatGL model/backend: `CHGNet-MatPES-PBE-2025.2.10-2.7M-PES`, `dgl`
+- DIRECT:
+  - `direct_threshold_init`: `0.05`
+  - DIRECT metric plots enabled by default
+- Temperature defaults:
+  - fixed temperatures: `(250, 300, 600, 900, 1200) K`
+  - auto mode: `n_points=5`, `include_300k=True`, `melting_temperature_margin=1.10`
+
+Additional runtime outputs enabled by default:
+
+- pre-run generation plan: `<output_dir>/generation_overview.json`
+- live MD runtime stats per backend:
+  - `<output_dir>/md_runtime_stats/md_progress_uma.json`
+  - `<output_dir>/md_runtime_stats/md_progress_matgl.json`
 
 ## Defaults for hydrothermal relithiation
 
