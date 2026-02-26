@@ -34,6 +34,18 @@ class SamplingConfig:
     phonon_fc2_path: Path | None = None
     phonon_qm_statistics: bool = False
     phonon_imag_freq_factor: float = 1.0
+    rattle_engine: str = "hiphive"
+    md_execution: str = "run"
+    md_ensemble: str = "nvt"
+    md_timestep_fs: float = 1.0
+    md_steps: int = 500
+    md_sample_interval: int = 10
+    md_friction_per_fs: float = 0.001
+    uma_model_name: str = "uma-s-1p1"
+    uma_task_id: str = "omat"
+    uma_device: str = "cuda"
+    direct_threshold_init: float = 0.05
+    direct_plot_metrics: bool = True
 
 
 @dataclass(slots=True)

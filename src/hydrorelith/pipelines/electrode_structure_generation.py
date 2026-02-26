@@ -6,12 +6,17 @@ import math
 import os
 import random
 import re
+import textwrap
+import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 from pymatgen.core import Structure
 from pymatgen.ext.matproj import MPRester
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -26,6 +31,7 @@ class GeneratedStructure:
     lithiation_fraction: float
     temperature_k: int | None = None
     candidate_index: int = 0
+    source_engine: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lithiation-step", type=float, default=0.05)
     parser.add_argument("--max-removal-combinations-per-fraction", type=int, default=200)
     parser.add_argument("--rattle-method", choices=["mc", "gaussian", "phonon"], default="mc")
+    parser.add_argument(
+        "--rattle-engine",
+        choices=["hiphive", "uma", "m3gnet", "all"],
+        default="hiphive",
+    )
+    parser.add_argument(
+        "--md-execution",
+        choices=["run", "slurm"],
+        default="run",
+        help="Run MLFF MD immediately or only create SLURM scripts.",
+    )
+    parser.add_argument("--md-ensemble", choices=["nvt", "npt"], default="nvt")
+    parser.add_argument("--md-timestep-fs", type=float, default=1.0)
+    parser.add_argument("--md-steps", type=int, default=500)
+    parser.add_argument("--md-sample-interval", type=int, default=10)
+    parser.add_argument("--md-friction-per-fs", type=float, default=0.001)
+    parser.add_argument("--uma-model-name", type=str, default="uma-s-1p1")
+    parser.add_argument("--uma-task-id", type=str, default="omat")
+    parser.add_argument("--uma-device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--rattles-per-structure", type=int, default=1)
     parser.add_argument("--rattle-std-300k", type=float, default=0.01)
     parser.add_argument("--rattle-d-min", type=float, default=1.5)
@@ -53,6 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phonon-fc2-path", type=Path, default=None)
     parser.add_argument("--phonon-qm-statistics", action="store_true")
     parser.add_argument("--phonon-imag-freq-factor", type=float, default=1.0)
+    parser.add_argument("--direct-threshold-init", type=float, default=0.05)
+    parser.add_argument("--disable-direct-metric-plots", action="store_true")
+    parser.add_argument("--slurm-generate-only", action="store_true")
+    parser.add_argument("--slurm-dir", type=Path, default=None)
+    parser.add_argument("--slurm-mode", choices=["cpu", "gpu"], default="cpu")
+    parser.add_argument("--slurm-queue", type=str, default="regular")
+    parser.add_argument("--slurm-allocation", type=str, default=None)
+    parser.add_argument("--slurm-time", type=str, default="1:00:00")
+    parser.add_argument("--slurm-ntasks-per-node", type=int, default=128)
+    parser.add_argument("--slurm-cpus-per-task", type=int, default=2)
+    parser.add_argument("--slurm-gpus", type=int, default=1)
+    parser.add_argument("--slurm-combined-jobs", action="store_true")
+    parser.add_argument("--only-temperature", type=int, default=None)
+    parser.add_argument("--only-lithiation-fraction", type=float, default=None)
+    parser.add_argument("--target-rattle-count", type=int, default=None)
     parser.add_argument(
         "--skip-direct",
         action="store_true",
@@ -103,6 +143,16 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.min_lithiation_fraction = args.min_lithiation_fraction
     config.sampling.lithiation_step = args.lithiation_step
     config.sampling.max_removal_combinations_per_fraction = args.max_removal_combinations_per_fraction
+    config.sampling.rattle_engine = args.rattle_engine
+    config.sampling.md_execution = args.md_execution
+    config.sampling.md_ensemble = args.md_ensemble
+    config.sampling.md_timestep_fs = args.md_timestep_fs
+    config.sampling.md_steps = args.md_steps
+    config.sampling.md_sample_interval = args.md_sample_interval
+    config.sampling.md_friction_per_fs = args.md_friction_per_fs
+    config.sampling.uma_model_name = args.uma_model_name
+    config.sampling.uma_task_id = args.uma_task_id
+    config.sampling.uma_device = args.uma_device
     config.sampling.rattle_method = args.rattle_method
     config.sampling.rattles_per_structure = args.rattles_per_structure
     config.sampling.rattle_std_300k = args.rattle_std_300k
@@ -112,6 +162,8 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.phonon_fc2_path = args.phonon_fc2_path
     config.sampling.phonon_qm_statistics = bool(args.phonon_qm_statistics)
     config.sampling.phonon_imag_freq_factor = args.phonon_imag_freq_factor
+    config.sampling.direct_threshold_init = args.direct_threshold_init
+    config.sampling.direct_plot_metrics = not bool(args.disable_direct_metric_plots)
 
     config.temperature.strategy = args.temperature_strategy
     config.temperature.values = tuple(args.temperatures)
@@ -137,15 +189,29 @@ class ElectrodeStructureGenerationPipeline:
         self.prepare_output_layout()
         base_structure = self.load_pristine_structure()
         delithiation_candidates = self.generate_delithiation_candidates(base_structure)
+        target_temperatures = self.resolve_target_temperatures(base_structure)
+        overview = self._build_generation_overview(
+            base_structure=base_structure,
+            delithiation_candidates=delithiation_candidates,
+            temperatures=target_temperatures,
+        )
+        self._write_generation_overview(overview)
         if getattr(self, "stop_after_delithiation", False):
             self.write_structures(delithiation_candidates)
             return
-        target_temperatures = self.resolve_target_temperatures(base_structure)
+
+        if getattr(self, "slurm_generate_only", False) and self.config.sampling.rattle_engine in {"uma", "m3gnet", "all"}:
+            self.write_structures(delithiation_candidates)
+            self.generate_slurm_files(target_temperatures, delithiation_candidates)
+            return
+
         rattled_candidates = self.generate_rattled_candidates(delithiation_candidates, target_temperatures)
         if getattr(self, "skip_direct", False):
             output_structures = rattled_candidates
         else:
             output_structures = self.select_with_direct(rattled_candidates)
+            if self.config.sampling.direct_plot_metrics:
+                self.plot_direct_metrics(rattled_candidates, output_structures)
         self.write_structures(output_structures)
 
     def bootstrap_output_tree(self) -> None:
@@ -200,6 +266,18 @@ class ElectrodeStructureGenerationPipeline:
         if self.config.sampling.phonon_imag_freq_factor <= 0.0:
             raise ValueError("--phonon-imag-freq-factor must be > 0")
 
+        if self.config.sampling.md_timestep_fs <= 0:
+            raise ValueError("--md-timestep-fs must be > 0")
+
+        if self.config.sampling.md_steps <= 0:
+            raise ValueError("--md-steps must be > 0")
+
+        if self.config.sampling.md_sample_interval <= 0:
+            raise ValueError("--md-sample-interval must be > 0")
+
+        if self.config.sampling.direct_threshold_init <= 0:
+            raise ValueError("--direct-threshold-init must be > 0")
+
     def prepare_output_layout(self) -> None:
         self.config.output.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,6 +329,16 @@ class ElectrodeStructureGenerationPipeline:
                 "min_lithiation_fraction": self.config.sampling.min_lithiation_fraction,
                 "lithiation_step": self.config.sampling.lithiation_step,
                 "max_removal_combinations_per_fraction": self.config.sampling.max_removal_combinations_per_fraction,
+                "rattle_engine": self.config.sampling.rattle_engine,
+                "md_execution": self.config.sampling.md_execution,
+                "md_ensemble": self.config.sampling.md_ensemble,
+                "md_timestep_fs": self.config.sampling.md_timestep_fs,
+                "md_steps": self.config.sampling.md_steps,
+                "md_sample_interval": self.config.sampling.md_sample_interval,
+                "md_friction_per_fs": self.config.sampling.md_friction_per_fs,
+                "uma_model_name": self.config.sampling.uma_model_name,
+                "uma_task_id": self.config.sampling.uma_task_id,
+                "uma_device": self.config.sampling.uma_device,
                 "rattle_method": self.config.sampling.rattle_method,
                 "rattles_per_structure": self.config.sampling.rattles_per_structure,
                 "rattle_std_300k": self.config.sampling.rattle_std_300k,
@@ -264,6 +352,8 @@ class ElectrodeStructureGenerationPipeline:
                 ),
                 "phonon_qm_statistics": self.config.sampling.phonon_qm_statistics,
                 "phonon_imag_freq_factor": self.config.sampling.phonon_imag_freq_factor,
+                "direct_threshold_init": self.config.sampling.direct_threshold_init,
+                "direct_plot_metrics": self.config.sampling.direct_plot_metrics,
             },
             "conditions": {
                 "temperatures_k": temperatures,
@@ -356,6 +446,108 @@ class ElectrodeStructureGenerationPipeline:
                 )
         return generated
 
+    def _count_target_ion_sites(self, structure: Structure) -> int:
+        ion_symbol = self.config.source.target_ion
+        return sum(1 for site in structure if site.specie.symbol == ion_symbol)
+
+    def _planned_engine_targets(self, total_target_count: int) -> dict[str, int]:
+        engine = self.config.sampling.rattle_engine
+        if engine == "all":
+            return self._split_counts(["hiphive", "uma", "m3gnet"], total_target_count)
+        return {engine: total_target_count}
+
+    def _planned_bin_targets(
+        self,
+        delithiation_candidates: list[GeneratedStructure],
+        temperatures: list[int],
+        target_count: int,
+    ) -> dict[tuple[int, float], int]:
+        lithiation_levels = sorted({item.lithiation_fraction for item in delithiation_candidates}, reverse=True)
+        bins = [(temperature, lithiation) for temperature in temperatures for lithiation in lithiation_levels]
+        bins = self._apply_bin_filters(bins)
+        per_bin_base = target_count // len(bins)
+        remainder = target_count % len(bins)
+        target_per_bin: dict[tuple[int, float], int] = {}
+        for idx, key in enumerate(bins):
+            target_per_bin[key] = per_bin_base + (1 if idx < remainder else 0)
+        return target_per_bin
+
+    def _build_generation_overview(
+        self,
+        base_structure: Structure,
+        delithiation_candidates: list[GeneratedStructure],
+        temperatures: list[int],
+    ) -> dict:
+        total_target_ions = self._count_target_ion_sites(base_structure)
+        missing_li_counts: dict[int, int] = defaultdict(int)
+        for item in delithiation_candidates:
+            present = self._count_target_ion_sites(item.structure)
+            missing = total_target_ions - present
+            missing_li_counts[int(missing)] += 1
+
+        target_total = getattr(self, "target_rattle_count", None)
+        if target_total is None:
+            target_total = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
+
+        engine_targets = self._planned_engine_targets(target_total)
+        rattling_by_engine: dict[str, dict] = {}
+        for engine_name, engine_target in engine_targets.items():
+            bin_targets = self._planned_bin_targets(
+                delithiation_candidates=delithiation_candidates,
+                temperatures=temperatures,
+                target_count=engine_target,
+            )
+            rattling_by_engine[engine_name] = {
+                "target_structures": int(engine_target),
+                "n_bins": int(len(bin_targets)),
+                "per_bin": [
+                    {
+                        "temperature_k": int(t),
+                        "lithiation_fraction": float(l),
+                        "target_structures": int(n),
+                    }
+                    for (t, l), n in sorted(bin_targets.items(), key=lambda x: (x[0][0], x[0][1]))
+                ],
+            }
+
+        return {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "target_ion": self.config.source.target_ion,
+            "n_target_ion_sites_pristine": int(total_target_ions),
+            "delithiation": {
+                "total_candidates": int(len(delithiation_candidates)),
+                "unique_missing_li_levels": int(len(missing_li_counts)),
+                "by_missing_li": [
+                    {
+                        "missing_li": int(missing),
+                        "candidate_count": int(count),
+                    }
+                    for missing, count in sorted(missing_li_counts.items(), key=lambda x: x[0])
+                ],
+            },
+            "rattling_plan": {
+                "rattle_engine": self.config.sampling.rattle_engine,
+                "md_execution": self.config.sampling.md_execution,
+                "target_pool_structures": int(target_total),
+                "engines": rattling_by_engine,
+            },
+            "temperatures_k": [int(t) for t in temperatures],
+        }
+
+    def _write_generation_overview(self, overview: dict) -> None:
+        overview_path = self.config.output.output_dir / "generation_overview.json"
+        overview_path.write_text(json.dumps(overview, indent=2), encoding="utf-8")
+
+        delith_total = overview["delithiation"]["total_candidates"]
+        unique_missing = overview["delithiation"]["unique_missing_li_levels"]
+        print(
+            f"[overview] delithiation candidates={delith_total}, unique missing-Li levels={unique_missing}"
+        )
+        for engine_name, plan in overview["rattling_plan"]["engines"].items():
+            print(
+                f"[overview] {engine_name} target rattled structures={plan['target_structures']} over {plan['n_bins']} bins"
+            )
+
     def _build_delithiation_targets(self, total_ion_sites: int) -> list[tuple[int, float]]:
         desired_fractions = self._build_lithiation_grid()
         unique_remove_counts: set[int] = set()
@@ -409,6 +601,33 @@ class ElectrodeStructureGenerationPipeline:
         structures: list[GeneratedStructure],
         temperatures: list[int],
     ) -> list[GeneratedStructure]:
+        target_count = getattr(self, "target_rattle_count", None)
+        if target_count is None:
+            target_count = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
+        engine = self.config.sampling.rattle_engine
+
+        if engine == "hiphive":
+            return self._generate_rattled_candidates_hiphive(structures, temperatures, target_count)
+        if engine == "uma":
+            return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="uma")
+        if engine == "m3gnet":
+            return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="m3gnet")
+        if engine == "all":
+            counts = self._split_counts(["hiphive", "uma", "m3gnet"], target_count)
+            combined: list[GeneratedStructure] = []
+            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, counts["hiphive"]))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["uma"], backend="uma"))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["m3gnet"], backend="m3gnet"))
+            return combined
+
+        raise ValueError(f"Unsupported rattle engine: {engine}")
+
+    def _generate_rattled_candidates_hiphive(
+        self,
+        structures: list[GeneratedStructure],
+        temperatures: list[int],
+        target_count: int,
+    ) -> list[GeneratedStructure]:
         try:
             from hiphive.structure_generation import (
                 generate_mc_rattled_structures,
@@ -422,13 +641,13 @@ class ElectrodeStructureGenerationPipeline:
 
         adaptor = AseAtomsAdaptor()
         expanded: list[GeneratedStructure] = []
-        target_count = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
         by_lithiation: dict[float, list[GeneratedStructure]] = defaultdict(list)
         for item in structures:
             by_lithiation[item.lithiation_fraction].append(item)
 
         lithiation_levels = sorted(by_lithiation.keys(), reverse=True)
         bins = [(temperature, lithiation) for temperature in temperatures for lithiation in lithiation_levels]
+        bins = self._apply_bin_filters(bins)
         per_bin_base = target_count // len(bins)
         remainder = target_count % len(bins)
         target_per_bin: dict[tuple[int, float], int] = {}
@@ -452,8 +671,8 @@ class ElectrodeStructureGenerationPipeline:
         except Exception:
             tqdm = None
 
-        for temperature in temperatures:
-            for lithiation in lithiation_levels:
+        for temperature in sorted({b[0] for b in bins}):
+            for lithiation in sorted({b[1] for b in bins if b[0] == temperature}, reverse=True):
                 n_bin = target_per_bin[(temperature, lithiation)]
                 base_candidates = list(by_lithiation[lithiation])
                 max_bases = min(self.config.sampling.max_base_structures_per_bin, len(base_candidates))
@@ -511,6 +730,7 @@ class ElectrodeStructureGenerationPipeline:
                                 lithiation_fraction=lithiation,
                                 temperature_k=temperature,
                                 candidate_index=base_item.candidate_index * 10_000 + rattle_idx,
+                                source_engine="hiphive",
                             )
                         )
                     if pbar is not None:
@@ -526,6 +746,534 @@ class ElectrodeStructureGenerationPipeline:
                 f"Generated {len(expanded)} rattled structures, expected exactly {target_count}"
             )
         return expanded
+
+    def _generate_rattled_candidates_mlff_md(
+        self,
+        structures: list[GeneratedStructure],
+        temperatures: list[int],
+        target_count: int,
+        backend: str,
+    ) -> list[GeneratedStructure]:
+        if self.config.sampling.md_execution != "run":
+            raise RuntimeError(
+                "MLFF MD generation requested but md_execution is not 'run'. Use --slurm-generate-only for script creation."
+            )
+
+        adaptor = AseAtomsAdaptor()
+        expanded: list[GeneratedStructure] = []
+        by_lithiation: dict[float, list[GeneratedStructure]] = defaultdict(list)
+        for item in structures:
+            by_lithiation[item.lithiation_fraction].append(item)
+
+        lithiation_levels = sorted(by_lithiation.keys(), reverse=True)
+        bins = [(temperature, lithiation) for temperature in temperatures for lithiation in lithiation_levels]
+        bins = self._apply_bin_filters(bins)
+        per_bin_base = target_count // len(bins)
+        remainder = target_count % len(bins)
+        target_per_bin: dict[tuple[int, float], int] = {}
+        for idx, key in enumerate(bins):
+            target_per_bin[key] = per_bin_base + (1 if idx < remainder else 0)
+
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
+
+        self._init_md_runtime_stats(backend=backend, target_count=target_count, target_per_bin=target_per_bin)
+
+        for temperature in sorted({b[0] for b in bins}):
+            for lithiation in sorted({b[1] for b in bins if b[0] == temperature}, reverse=True):
+                n_bin = target_per_bin[(temperature, lithiation)]
+                base_candidates = list(by_lithiation[lithiation])
+                max_bases = min(self.config.sampling.max_base_structures_per_bin, len(base_candidates))
+                rng = random.Random(9_000_001 * temperature + int(round(lithiation * 10000)))
+                rng.shuffle(base_candidates)
+                selected_bases = base_candidates[:max_bases]
+
+                base_work = [n_bin // max_bases] * max_bases
+                for idx in range(n_bin % max_bases):
+                    base_work[idx] += 1
+
+                progress_desc = f"{backend.upper()} MD T={temperature}K lith={lithiation*100:.2f}%"
+                pbar = tqdm(total=n_bin, desc=progress_desc, leave=False) if tqdm else None
+
+                for base_idx, base_item in enumerate(selected_bases):
+                    n_structures = base_work[base_idx]
+                    if n_structures <= 0:
+                        continue
+
+                    atoms = adaptor.get_atoms(base_item.structure)
+                    seed = 7_000_001 * temperature + 151 * base_item.candidate_index + 19
+
+                    def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
+                        self._update_md_runtime_stats(
+                            backend=backend,
+                            temperature=temperature,
+                            lithiation=lithiation,
+                            stage=stage,
+                            completed_delta=0,
+                            base_index=base_idx + 1,
+                            base_total=max_bases,
+                            md_steps_done=md_steps_done,
+                            md_steps_total=md_steps_total,
+                            snapshots_captured=captured,
+                        )
+
+                    self._update_md_runtime_stats(
+                        backend=backend,
+                        temperature=temperature,
+                        lithiation=lithiation,
+                        stage="base_start",
+                        completed_delta=0,
+                        base_index=base_idx + 1,
+                        base_total=max_bases,
+                        md_steps_done=0,
+                        md_steps_total=0,
+                        snapshots_captured=0,
+                    )
+
+                    try:
+                        if backend == "uma":
+                            snapshots = self._run_uma_md_snapshots(
+                                atoms,
+                                temperature,
+                                n_structures,
+                                seed,
+                                progress_callback=_progress_callback,
+                            )
+                        elif backend == "m3gnet":
+                            snapshots = self._run_m3gnet_md_snapshots(
+                                atoms,
+                                temperature,
+                                n_structures,
+                                seed,
+                                progress_callback=_progress_callback,
+                            )
+                        else:
+                            raise ValueError(f"Unsupported MLFF backend: {backend}")
+                    except Exception as exc:
+                        self._fail_md_runtime_stats(
+                            backend=backend,
+                            error_message=str(exc),
+                            temperature=temperature,
+                            lithiation=lithiation,
+                        )
+                        raise
+
+                    for snap_idx, snap_atoms in enumerate(snapshots):
+                        expanded.append(
+                            GeneratedStructure(
+                                structure=adaptor.get_structure(snap_atoms),
+                                lithiation_fraction=lithiation,
+                                temperature_k=temperature,
+                                candidate_index=base_item.candidate_index * 100_000 + snap_idx,
+                                source_engine=backend,
+                            )
+                        )
+                    if pbar is not None:
+                        pbar.update(len(snapshots))
+
+                    self._update_md_runtime_stats(
+                        backend=backend,
+                        temperature=temperature,
+                        lithiation=lithiation,
+                        stage="base_complete",
+                        completed_delta=len(snapshots),
+                        base_index=base_idx + 1,
+                        base_total=max_bases,
+                        md_steps_done=self.config.sampling.md_steps,
+                        md_steps_total=self.config.sampling.md_steps,
+                        snapshots_captured=len(snapshots),
+                    )
+
+                if pbar is not None:
+                    pbar.close()
+                else:
+                    print(f"[progress] generated {n_bin} {backend} MD structures for {progress_desc}")
+
+        self._finalize_md_runtime_stats(backend=backend, final_count=len(expanded), target_count=target_count)
+
+        if len(expanded) != target_count:
+            raise RuntimeError(
+                f"Generated {len(expanded)} structures from {backend} MD, expected exactly {target_count}"
+            )
+        return expanded
+
+    def _apply_bin_filters(self, bins: list[tuple[int, float]]) -> list[tuple[int, float]]:
+        filtered = bins
+        only_t = getattr(self, "only_temperature", None)
+        only_l = getattr(self, "only_lithiation_fraction", None)
+        if only_t is not None:
+            filtered = [b for b in filtered if b[0] == only_t]
+        if only_l is not None:
+            filtered = [b for b in filtered if abs(b[1] - only_l) <= 1e-6]
+        if not filtered:
+            raise ValueError("Bin filters produced no temperature/lithiation combinations.")
+        return filtered
+
+    def _run_uma_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+        from ase import units
+        from ase.md.langevin import Langevin
+        from fairchem.core import FAIRChemCalculator, pretrained_mlip
+
+        if not hasattr(self, "_uma_predictor"):
+            self._uma_predictor = pretrained_mlip.get_predict_unit(
+                self.config.sampling.uma_model_name,
+                device=self.config.sampling.uma_device,
+            )
+
+        atoms = atoms.copy()
+        atoms.calc = FAIRChemCalculator(self._uma_predictor, task_name=self.config.sampling.uma_task_id)
+
+        dyn = Langevin(
+            atoms,
+            timestep=self.config.sampling.md_timestep_fs * units.fs,
+            temperature_K=float(temperature),
+            friction=self.config.sampling.md_friction_per_fs / units.fs,
+        )
+
+        snapshots = []
+
+        def _capture():
+            snapshots.append(atoms.copy())
+
+        dyn.attach(_capture, interval=self.config.sampling.md_sample_interval)
+        n_steps = max(self.config.sampling.md_steps, n_structures * self.config.sampling.md_sample_interval)
+
+        if progress_callback is not None:
+            sample_interval = self.config.sampling.md_sample_interval
+
+            def _progress_hook():
+                captured = len(snapshots)
+                done_steps = min(n_steps, captured * sample_interval)
+                progress_callback(
+                    stage="running",
+                    captured=captured,
+                    md_steps_done=done_steps,
+                    md_steps_total=n_steps,
+                )
+
+            dyn.attach(_progress_hook, interval=sample_interval)
+
+        dyn.run(steps=n_steps)
+        return self._select_even_snapshots(snapshots, n_structures)
+
+    def _run_m3gnet_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+        from ase.io.trajectory import Trajectory
+        from m3gnet.models import MolecularDynamics
+
+        del seed
+        tmp_dir = self.config.output.output_dir / "_tmp_md"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        token = random.randint(10_000, 99_999)
+        traj_path = tmp_dir / f"m3gnet_T{temperature}_{token}.traj"
+        log_path = tmp_dir / f"m3gnet_T{temperature}_{token}.log"
+
+        n_steps = max(self.config.sampling.md_steps, n_structures * self.config.sampling.md_sample_interval)
+        md = MolecularDynamics(
+            atoms=atoms.copy(),
+            ensemble=self.config.sampling.md_ensemble,
+            temperature=float(temperature),
+            timestep=float(self.config.sampling.md_timestep_fs),
+            trajectory=str(traj_path),
+            logfile=str(log_path),
+            loginterval=int(self.config.sampling.md_sample_interval),
+        )
+        if progress_callback is None:
+            md.run(steps=n_steps)
+        else:
+            done_steps = 0
+            chunk = max(1, int(self.config.sampling.md_sample_interval))
+            while done_steps < n_steps:
+                run_steps = min(chunk, n_steps - done_steps)
+                md.run(steps=run_steps)
+                done_steps += run_steps
+                captured = done_steps // chunk
+                progress_callback(
+                    stage="running",
+                    captured=captured,
+                    md_steps_done=done_steps,
+                    md_steps_total=n_steps,
+                )
+
+        with Trajectory(str(traj_path)) as traj:
+            snapshots = [frame.copy() for frame in traj]
+
+        return self._select_even_snapshots(snapshots, n_structures)
+
+    def _select_even_snapshots(self, snapshots, n_keep: int):
+        if len(snapshots) <= n_keep:
+            return snapshots
+        indices = np.linspace(0, len(snapshots) - 1, n_keep, dtype=int)
+        return [snapshots[i] for i in indices]
+
+    def _split_counts(self, keys: list[str], total: int) -> dict[str, int]:
+        base = total // len(keys)
+        rem = total % len(keys)
+        out = {key: base for key in keys}
+        for idx, key in enumerate(keys):
+            if idx < rem:
+                out[key] += 1
+        return out
+
+    def _md_stats_dir(self) -> Path:
+        stats_dir = self.config.output.output_dir / "md_runtime_stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        return stats_dir
+
+    def _md_stats_path(self, backend: str) -> Path:
+        return self._md_stats_dir() / f"md_progress_{backend}.json"
+
+    def _init_md_runtime_stats(
+        self,
+        backend: str,
+        target_count: int,
+        target_per_bin: dict[tuple[int, float], int],
+    ) -> None:
+        now = time.time()
+        self._md_runtime_state = getattr(self, "_md_runtime_state", {})
+        self._md_runtime_state[backend] = {
+            "backend": backend,
+            "status": "running",
+            "error_message": None,
+            "start_epoch_s": now,
+            "last_update_epoch_s": now,
+            "target_structures": int(target_count),
+            "completed_structures": 0,
+            "rate_structures_per_min": 0.0,
+            "eta_seconds": None,
+            "eta_utc": None,
+            "bins": {
+                f"T{t}_lith_{l:.6f}": {
+                    "temperature_k": int(t),
+                    "lithiation_fraction": float(l),
+                    "target_structures": int(n),
+                    "completed_structures": 0,
+                    "base_index": 0,
+                    "base_total": 0,
+                    "md_steps_done": 0,
+                    "md_steps_total": 0,
+                    "snapshots_captured": 0,
+                    "stage": "pending",
+                    "error_message": None,
+                }
+                for (t, l), n in sorted(target_per_bin.items(), key=lambda x: (x[0][0], x[0][1]))
+            },
+        }
+        self._write_md_runtime_stats(backend)
+
+    def _update_md_runtime_stats(
+        self,
+        backend: str,
+        temperature: int,
+        lithiation: float,
+        stage: str,
+        completed_delta: int,
+        base_index: int,
+        base_total: int,
+        md_steps_done: int,
+        md_steps_total: int,
+        snapshots_captured: int,
+    ) -> None:
+        state = getattr(self, "_md_runtime_state", {}).get(backend)
+        if state is None:
+            return
+
+        key = f"T{temperature}_lith_{lithiation:.6f}"
+        bin_state = state["bins"].get(key)
+        if bin_state is None:
+            return
+
+        if completed_delta:
+            state["completed_structures"] += int(completed_delta)
+            bin_state["completed_structures"] += int(completed_delta)
+
+        bin_state["base_index"] = int(base_index)
+        bin_state["base_total"] = int(base_total)
+        bin_state["md_steps_done"] = int(md_steps_done)
+        bin_state["md_steps_total"] = int(md_steps_total)
+        bin_state["snapshots_captured"] = int(snapshots_captured)
+        bin_state["stage"] = stage
+        bin_state["error_message"] = None
+
+        now = time.time()
+        elapsed = max(now - state["start_epoch_s"], 1e-9)
+        completed = int(state["completed_structures"])
+        target = int(state["target_structures"])
+        rate_per_sec = completed / elapsed
+        state["rate_structures_per_min"] = float(rate_per_sec * 60.0)
+        remaining = max(target - completed, 0)
+        if rate_per_sec > 0 and remaining > 0:
+            eta_seconds = remaining / rate_per_sec
+            eta_epoch = now + eta_seconds
+            state["eta_seconds"] = float(eta_seconds)
+            state["eta_utc"] = datetime.fromtimestamp(eta_epoch, tz=timezone.utc).isoformat()
+        elif remaining == 0:
+            state["eta_seconds"] = 0.0
+            state["eta_utc"] = datetime.now(timezone.utc).isoformat()
+        else:
+            state["eta_seconds"] = None
+            state["eta_utc"] = None
+
+        state["last_update_epoch_s"] = now
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+        self._write_md_runtime_stats(backend)
+
+    def _finalize_md_runtime_stats(self, backend: str, final_count: int, target_count: int) -> None:
+        state = getattr(self, "_md_runtime_state", {}).get(backend)
+        if state is None:
+            return
+        state["completed_structures"] = int(final_count)
+        state["target_structures"] = int(target_count)
+        state["status"] = "completed"
+        state["eta_seconds"] = 0.0
+        state["eta_utc"] = datetime.now(timezone.utc).isoformat()
+        state["last_update_epoch_s"] = time.time()
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+        self._write_md_runtime_stats(backend)
+
+    def _fail_md_runtime_stats(
+        self,
+        backend: str,
+        error_message: str,
+        temperature: int | None = None,
+        lithiation: float | None = None,
+    ) -> None:
+        state = getattr(self, "_md_runtime_state", {}).get(backend)
+        if state is None:
+            return
+
+        state["status"] = "failed"
+        state["error_message"] = str(error_message)
+        state["eta_seconds"] = None
+        state["eta_utc"] = None
+        state["last_update_epoch_s"] = time.time()
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+
+        if temperature is not None and lithiation is not None:
+            key = f"T{temperature}_lith_{lithiation:.6f}"
+            bin_state = state.get("bins", {}).get(key)
+            if bin_state is not None:
+                bin_state["stage"] = "failed"
+                bin_state["error_message"] = str(error_message)
+
+        self._write_md_runtime_stats(backend)
+
+    def _write_md_runtime_stats(self, backend: str) -> None:
+        state = getattr(self, "_md_runtime_state", {}).get(backend)
+        if state is None:
+            return
+        path = self._md_stats_path(backend)
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def generate_slurm_files(self, temperatures: list[int], delithiation_candidates: list[GeneratedStructure]) -> None:
+        slurm_dir = getattr(self, "slurm_dir", None) or (self.config.output.output_dir / "slurm_jobs")
+        slurm_dir.mkdir(parents=True, exist_ok=True)
+
+        engines = [self.config.sampling.rattle_engine]
+        if self.config.sampling.rattle_engine == "all":
+            engines = ["hiphive", "uma", "m3gnet"]
+
+        md_engines = [engine for engine in engines if engine in {"uma", "m3gnet"}]
+
+        allocation = getattr(self, "slurm_allocation", None)
+        mode = getattr(self, "slurm_mode", "cpu")
+        if allocation is None:
+            allocation = "m4537_g" if mode == "gpu" else "m4537"
+
+        lith_levels = sorted({item.lithiation_fraction for item in delithiation_candidates}, reverse=True)
+        bins = [(t, l) for t in temperatures for l in lith_levels]
+        target_total = getattr(self, "target_rattle_count", None)
+        if target_total is None:
+            target_total = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
+        per_bin = target_total // max(len(bins), 1)
+
+        split_jobs = not bool(getattr(self, "slurm_combined_jobs", False))
+
+        if split_jobs:
+            for engine in md_engines:
+                for temperature, lith in bins:
+                    lith_pct = 100.0 * lith
+                    script_path = slurm_dir / f"run_{engine}_T{temperature}_lith_{lith_pct:.2f}.slurm"
+                    header = self._render_slurm_header(job_name=f"{engine}_T{temperature}_L{lith_pct:.0f}")
+                    cmd = (
+                        "PYTHONPATH=src python -m hydrorelith.pipelines.electrode_structure_generation "
+                        f"--mpid {self.config.source.mpid} --target-ion {self.config.source.target_ion} "
+                        f"--output-dir {self.config.output.output_dir} --output-format {self.config.output.output_format} "
+                        f"--max-structures {self.config.sampling.max_structures} --oversampling-factor {self.config.sampling.oversampling_factor} "
+                        f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
+                        f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
+                        f"--rattle-engine {engine} --md-execution run --skip-direct "
+                        f"--only-temperature {temperature} --only-lithiation-fraction {lith:.8f} "
+                        f"--target-rattle-count {per_bin} --temperatures {' '.join(str(t) for t in temperatures)}"
+                    )
+                    script_path.write_text(f"{header}\n{cmd}\n", encoding="utf-8")
+        else:
+            for engine in md_engines:
+                script_path = slurm_dir / f"run_{engine}_rattling.slurm"
+                header = self._render_slurm_header(job_name=f"rattle_{engine}")
+                cmd = (
+                    "PYTHONPATH=src python -m hydrorelith.pipelines.electrode_structure_generation "
+                    f"--mpid {self.config.source.mpid} --target-ion {self.config.source.target_ion} "
+                    f"--output-dir {self.config.output.output_dir} --output-format {self.config.output.output_format} "
+                    f"--max-structures {self.config.sampling.max_structures} --oversampling-factor {self.config.sampling.oversampling_factor} "
+                    f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
+                    f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
+                    f"--rattle-engine {engine} --md-execution run --skip-direct "
+                    f"--temperatures {' '.join(str(t) for t in temperatures)}"
+                )
+                script_path.write_text(f"{header}\n{cmd}\n", encoding="utf-8")
+
+        plot_script = slurm_dir / "plot_direct_metrics.slurm"
+        plot_header = self._render_slurm_header(job_name="plot_direct_metrics")
+        plot_cmd = (
+            "PYTHONPATH=src python -m hydrorelith.pipelines.electrode_structure_generation "
+            f"--mpid {self.config.source.mpid} --target-ion {self.config.source.target_ion} "
+            f"--output-dir {self.config.output.output_dir} --stop-after-delithiation"
+        )
+        plot_note = "# Replace command above with your post-MD plotting workflow if running MD jobs separately."
+        plot_script.write_text(f"{plot_header}\n{plot_note}\n{plot_cmd}\n", encoding="utf-8")
+
+    def _render_slurm_header(self, job_name: str) -> str:
+        mode = getattr(self, "slurm_mode", "cpu")
+        queue = getattr(self, "slurm_queue", "regular")
+        allocation = getattr(self, "slurm_allocation", None)
+        if allocation is None:
+            allocation = "m4537_g" if mode == "gpu" else "m4537"
+        time_limit = getattr(self, "slurm_time", "1:00:00")
+
+        if mode == "gpu":
+            gpus = getattr(self, "slurm_gpus", 1)
+            return textwrap.dedent(
+                f"""#!/bin/bash
+#SBATCH -C gpu
+#SBATCH -q {queue}
+#SBATCH -A {allocation}
+#SBATCH -N 1
+#SBATCH -t {time_limit}
+#SBATCH -J {job_name}
+#SBATCH -o %x-%j.out
+#SBATCH -e %x-%j.err
+#SBATCH --gpus {gpus}
+"""
+            )
+
+        ntasks = getattr(self, "slurm_ntasks_per_node", 128)
+        cpus = getattr(self, "slurm_cpus_per_task", 2)
+        return textwrap.dedent(
+            f"""#!/bin/bash
+#SBATCH -C cpu
+#SBATCH -q {queue}
+#SBATCH -A {allocation}
+#SBATCH -N 1
+#SBATCH --ntasks-per-node={ntasks}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH -t {time_limit}
+#SBATCH -J {job_name}
+#SBATCH -o %x-%j.out
+#SBATCH -e %x-%j.err
+"""
+        )
 
     def select_with_direct(self, structures: list[GeneratedStructure]) -> list[GeneratedStructure]:
         if len(structures) <= self.config.sampling.max_structures:
@@ -553,7 +1301,7 @@ class ElectrodeStructureGenerationPipeline:
             if quota <= 0:
                 continue
             local_vectors = np.array([descriptors[i] for i in candidate_indices], dtype=float)
-            local_selected = self._greedy_maximin_indices(local_vectors, quota)
+            local_selected = self._run_maml_direct(local_vectors, quota)
             selected_indices.extend(candidate_indices[i] for i in local_selected)
 
         if len(selected_indices) < self.config.sampling.max_structures:
@@ -567,6 +1315,132 @@ class ElectrodeStructureGenerationPipeline:
 
         selected_indices = selected_indices[: self.config.sampling.max_structures]
         return [structures[i] for i in selected_indices]
+
+    def _run_maml_direct(self, vectors: np.ndarray, n_select: int) -> list[int]:
+        if len(vectors) <= n_select:
+            return list(range(len(vectors)))
+        from maml.sampling.direct import BirchClustering, DIRECTSampler, SelectKFromClusters
+
+        sampler = DIRECTSampler(
+            structure_encoder=None,
+            clustering=BirchClustering(n=n_select, threshold_init=self.config.sampling.direct_threshold_init),
+            select_k_from_clusters=SelectKFromClusters(k=1),
+        )
+        result = sampler.fit_transform(vectors)
+        selected = [int(i) for i in result.get("selected_indexes", [])]
+        if len(selected) < n_select:
+            remaining = [i for i in range(len(vectors)) if i not in set(selected)]
+            fill = self._greedy_maximin_indices(vectors[remaining], min(n_select - len(selected), len(remaining)))
+            selected.extend(remaining[i] for i in fill)
+        return selected[:n_select]
+
+    def plot_direct_metrics(
+        self,
+        all_structures: list[GeneratedStructure],
+        selected_structures: list[GeneratedStructure],
+    ) -> None:
+        if not all_structures or not selected_structures:
+            return
+
+        all_features = np.array([self._compute_descriptor(item) for item in all_structures], dtype=float)
+        selected_features = np.array([self._compute_descriptor(item) for item in selected_structures], dtype=float)
+
+        selected_indexes: list[int] = []
+        used = set()
+        for sf in selected_features:
+            candidates = np.where(np.all(np.isclose(all_features, sf, atol=1e-8), axis=1))[0]
+            for idx in candidates:
+                if idx not in used:
+                    selected_indexes.append(int(idx))
+                    used.add(int(idx))
+                    break
+
+        metrics_dir = self.config.output.output_dir / "direct_metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        from sklearn.decomposition import PCA
+
+        n_components = min(30, all_features.shape[0], all_features.shape[1])
+        pca = PCA(n_components=n_components)
+        pca_features = pca.fit_transform(all_features)
+        explained_variance = pca.explained_variance_ratio_
+
+        plt.figure(figsize=(6, 4))
+        plt.plot(range(1, n_components + 1), explained_variance[:n_components] * 100, "o-")
+        plt.xlabel("i-th PC")
+        plt.ylabel("Explained variance")
+        ax = plt.gca()
+        ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "explained_variance.png", dpi=200)
+        plt.close()
+
+        weighted = pca_features[:, : min(7, pca_features.shape[1])]
+        if weighted.shape[1] >= 2:
+            plt.figure(figsize=(6, 6))
+            plt.plot(weighted[:, 0], weighted[:, 1], "*", alpha=0.4, label=f"All {len(weighted):,} structures")
+            sel = weighted[selected_indexes]
+            plt.plot(sel[:, 0], sel[:, 1], "*", alpha=0.6, label=f"DIRECT selected {len(sel):,}")
+            plt.xlabel("PC 1")
+            plt.ylabel("PC 2")
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(metrics_dir / "pca_coverage_direct.png", dpi=200)
+            plt.close()
+
+            manual_selection_index = [int(i) for i in np.linspace(0, len(weighted) - 1, len(selected_indexes))]
+            plt.figure(figsize=(6, 6))
+            plt.plot(weighted[:, 0], weighted[:, 1], "*", alpha=0.4, label=f"All {len(weighted):,} structures")
+            man = weighted[manual_selection_index]
+            plt.plot(man[:, 0], man[:, 1], "*", alpha=0.6, label=f"Manual selected {len(man):,}")
+            plt.xlabel("PC 1")
+            plt.ylabel("PC 2")
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(metrics_dir / "pca_coverage_manual.png", dpi=200)
+            plt.close()
+
+        n_pcs_score = min(7, weighted.shape[1])
+        scores_direct = [
+            self._coverage_score(weighted[:, i], selected_indexes, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+        manual_selection_index = [int(i) for i in np.linspace(0, len(weighted) - 1, len(selected_indexes))]
+        scores_manual = [
+            self._coverage_score(weighted[:, i], manual_selection_index, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+
+        x = np.arange(n_pcs_score)
+        plt.figure(figsize=(10, 4))
+        plt.bar(
+            x + 0.2,
+            scores_direct,
+            width=0.35,
+            label=f"DIRECT (mean={np.mean(scores_direct):.3f})",
+        )
+        plt.bar(
+            x - 0.2,
+            scores_manual,
+            width=0.35,
+            label=f"Manual (mean={np.mean(scores_manual):.3f})",
+        )
+        plt.xticks(x, [f"PC {i+1}" for i in range(n_pcs_score)])
+        plt.ylim(0, 1.05)
+        plt.ylabel("Coverage score")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "coverage_scores.png", dpi=200)
+        plt.close()
+
+    def _coverage_score(self, values: np.ndarray, selected_indexes: list[int], n_bins: int = 100) -> float:
+        selected_values = values[selected_indexes]
+        bins = np.linspace(float(np.min(values)), float(np.max(values)), n_bins)
+        n_all = np.count_nonzero(np.histogram(values, bins=bins)[0])
+        n_sel = np.count_nonzero(np.histogram(selected_values, bins=bins)[0])
+        if n_all == 0:
+            return 0.0
+        return n_sel / n_all
 
     def _allocate_direct_quotas(self, structures: list[GeneratedStructure]) -> dict[tuple[int, float], int]:
         grouped_counts: dict[tuple[int, float], int] = defaultdict(int)
@@ -719,11 +1593,19 @@ class ElectrodeStructureGenerationPipeline:
             if item.temperature_k is None:
                 target_dir = base_dir / lith_dir_name
             else:
-                target_dir = (
-                    base_dir
-                    / f"T_{item.temperature_k}K"
-                    / lith_dir_name
-                )
+                if self.config.sampling.rattle_engine == "all" and item.source_engine is not None:
+                    target_dir = (
+                        base_dir
+                        / f"engine_{item.source_engine}"
+                        / f"T_{item.temperature_k}K"
+                        / lith_dir_name
+                    )
+                else:
+                    target_dir = (
+                        base_dir
+                        / f"T_{item.temperature_k}K"
+                        / lith_dir_name
+                    )
             target_dir.mkdir(parents=True, exist_ok=True)
 
             if self.config.output.output_format == "poscar":
@@ -741,6 +1623,19 @@ def main() -> None:
     pipeline = ElectrodeStructureGenerationPipeline(config=config)
     pipeline.stop_after_delithiation = bool(args.stop_after_delithiation)
     pipeline.skip_direct = bool(args.skip_direct)
+    pipeline.slurm_generate_only = bool(args.slurm_generate_only)
+    pipeline.slurm_dir = args.slurm_dir
+    pipeline.slurm_mode = args.slurm_mode
+    pipeline.slurm_queue = args.slurm_queue
+    pipeline.slurm_allocation = args.slurm_allocation
+    pipeline.slurm_time = args.slurm_time
+    pipeline.slurm_ntasks_per_node = args.slurm_ntasks_per_node
+    pipeline.slurm_cpus_per_task = args.slurm_cpus_per_task
+    pipeline.slurm_gpus = args.slurm_gpus
+    pipeline.slurm_combined_jobs = bool(args.slurm_combined_jobs)
+    pipeline.only_temperature = args.only_temperature
+    pipeline.only_lithiation_fraction = args.only_lithiation_fraction
+    pipeline.target_rattle_count = args.target_rattle_count
     if args.bootstrap_output_tree:
         pipeline.bootstrap_output_tree()
         return

@@ -8,14 +8,21 @@ version = "0.1.0"
 description = "Computational workflows for hydrothermal cathode relithiation experiments"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
-
-[project.optional-dependencies]
-electrode-generation = [
+dependencies = [
+  "numpy",
+  "scikit-learn>=1.6.1",
+  "matplotlib",
+  "tqdm",
   "ase",
   "pymatgen",
   "hiphive",
-  "numpy",
+  "fairchem-core",
+  "m3gnet",
+]
+
+[project.optional-dependencies]
+electrode-generation = [
+  "maml",
 ]
 dev = [
   "pytest",

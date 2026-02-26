@@ -8,6 +8,12 @@ Create a robust and diverse training set for electrode MLFF models by combining:
 2. Temperature-dependent structural rattling
 3. DIRECT subset selection to enforce diversity and robustness
 
+Rattling can be performed with three alternatives:
+
+- hiPhive (gaussian / MC / phonon-rattle)
+- UMA MLFF molecular dynamics (`fairchem`, `omat` default task)
+- M3GNet MLFF molecular dynamics
+
 ## Defaults for hydrothermal relithiation
 
 These defaults prioritize realistic near-operating and near-equilibrium states while retaining high-temperature coverage:
@@ -43,6 +49,8 @@ Rationale:
 - Parse and validate user input.
 - Resolve temperature list from fixed/auto strategy.
 - Build delithiation targets and removal combinations.
-- Generate rattled candidates (phonon-rattle preferred).
-- Apply DIRECT-style descriptor-space sampler under retention constraints.
+- Generate rattled candidates (phonon-rattle preferred for hiPhive).
+- Generate MD-rattled candidates with UMA/M3GNet as alternatives.
+- Apply DIRECT-style sampler (maml interface) under retention constraints.
+- Emit DIRECT quality plots (PCA coverage and feature coverage scores).
 - Export structures into temperature/lithiation directory tree.

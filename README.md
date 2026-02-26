@@ -25,7 +25,7 @@ This commit provides **backbone infrastructure only** and a detailed scaffold fo
 - Default hydrothermal-oriented sampling ratios and retention policies.
 - DIRECT subset selection placeholder.
 
-Current executable stage includes pristine loading (MPID/local), delithiation candidate generation, and hiPhive-based temperature-dependent rattling.
+Current executable stage includes pristine loading (MPID/local), delithiation candidate generation, rattling via hiPhive or MLFF-MD (UMA/M3GNet), and DIRECT selection with plotting outputs.
 
 ## Repository layout
 
@@ -66,13 +66,16 @@ Inputs accepted by the scaffold:
 - Minimum lithiation fraction (default `0.75`)
 - Lithiation step for planned bins (default `0.05`)
 - Maximum random ion-removal combinations per lithiation bin (default `200`)
-- Rattle method (`mc` or `gaussian`, default `mc`)
+- Rattle engine (`hiphive`, `uma`, `m3gnet`, or `all`; default `hiphive`)
+- For `hiphive`, rattle method (`mc`, `gaussian`, or `phonon`, default `mc`)
 - Rattles per base structure (default `1`)
 - Rattle amplitude at 300 K (default `0.01`, scales as $\sqrt{T/300}$)
 - MC minimum distance (`d_min`, default `1.5` Å)
 - MC iterations (`n_iter`, default `10`)
 - Optional phonon-rattle mode (`rattle_method=phonon`) if `phonon_fc2_path` is provided
 - Per-temperature and per-lithiation progress bars during rattling
+- MLFF-MD options for UMA (`fairchem`) and M3GNet with NVT/NPT controls
+- `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
 - Temperature strategy:
   - Fixed list default: `[250, 300, 600, 900, 1200]` K
   - Auto mode: 5 points between 250 K and 1.1 × melting temperature, forced inclusion of 300 K
@@ -83,18 +86,79 @@ Generation strategy:
 - Generate delithiation combinations down to the minimum lithiation with capped, fast random sampling.
 - Use one representative for 100% lithiated and single-vacancy states.
 - Oversample pool by default to `10x` final target.
-- Apply hiPhive rattling (phonon-rattle preferred where available).
-- Apply DIRECT-style descriptor-based diversity sampling to down-select robust training structures.
+- Apply rattling via selected engine: hiPhive, UMA MD, M3GNet MD, or all three.
+- Apply `maml`-style DIRECT sampling to down-select robust training structures.
 - Use `--skip-direct` if you need to emit the full pre-DIRECT pool.
 - Preserve user-defined sampling ratios across lithiation bins and temperature bins.
+
+DIRECT plotting outputs are written to:
+
+```text
+<output_dir>/direct_metrics/
+├── explained_variance.png
+├── pca_coverage_direct.png
+├── pca_coverage_manual.png
+└── coverage_scores.png
+```
+
+Upfront generation overview (written before rattling starts):
+
+```text
+<output_dir>/generation_overview.json
+```
+
+This file includes:
+
+- counts of delithiation candidates by unique missing-Li levels
+- planned rattled structure counts per method/backend
+- planned per-bin counts by temperature and lithiation fraction
+
+Real-time MD progress/ETA outputs (updated during UMA/M3GNet runs):
+
+```text
+<output_dir>/md_runtime_stats/
+├── md_progress_uma.json
+└── md_progress_m3gnet.json
+```
+
+These files track completed structures, current bin progress, effective generation rate, ETA to completion, and failure state (`status=failed`, `error_message`) if an MD backend exits with an exception.
+
+If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:
+
+```text
+<output_dir>/slurm_jobs/
+├── run_uma_T<temp>_lith_<percent>.slurm
+├── run_m3gnet_T<temp>_lith_<percent>.slurm
+├── ... (one script per MD temperature × lithiation bin by default)
+├── run_uma_rattling.slurm (when `--slurm-combined-jobs` is passed)
+├── run_m3gnet_rattling.slurm (when `--slurm-combined-jobs` is passed)
+└── plot_direct_metrics.slurm
+```
+
+Default SLURM walltime is `1:00:00`.
+
+Quick example (run directly on terminal, no SLURM files):
+
+```bash
+PYTHONPATH=src python -m hydrorelith.pipelines.electrode_structure_generation \
+  --mpid mp-22526 \
+  --target-ion Li \
+  --rattle-engine all \
+  --md-execution run \
+  --max-structures 600 \
+  --oversampling-factor 10 \
+  --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation
+```
+
+Use `--skip-direct` if you want to keep the full pre-DIRECT pool instead of down-selecting.
 
 Output layout target:
 
 ```text
 electrode_structures/
-└── T_<temp>K/
-    └── lith_<percent>pct/
-        └── POSCAR (or .cif)
+└── T_<temp>K/ or engine_<backend>/T_<temp>K/ (when `rattle_engine=all`)
+  └── lith_<percent>pct/
+    └── POSCAR (or .cif)
 ```
 
 Backbone utility command (works before full generation internals exist):

@@ -15,6 +15,16 @@ electrode_generation:
     min_lithiation_fraction: 0.75
     lithiation_step: 0.05
     max_removal_combinations_per_fraction: 200
+    rattle_engine: hiphive
+    md_execution: run
+    md_ensemble: nvt
+    md_timestep_fs: 1.0
+    md_steps: 500
+    md_sample_interval: 10
+    md_friction_per_fs: 0.001
+    uma_model_name: uma-s-1p1
+    uma_task_id: omat
+    uma_device: cuda
     rattle_method: mc
     rattles_per_structure: 1
     rattle_std_300k: 0.01
@@ -24,6 +34,8 @@ electrode_generation:
     phonon_fc2_path: null
     phonon_qm_statistics: false
     phonon_imag_freq_factor: 1.0
+    direct_threshold_init: 0.05
+    direct_plot_metrics: true
 
   temperature:
     strategy: fixed
