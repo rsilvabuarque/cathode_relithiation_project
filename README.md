@@ -179,12 +179,20 @@ hrw-electrode-generate --help
 Recommended clean install path for UMA + MatGL:
 
 ```bash
-python -m pip install fairchem-core matgl
-# Install a DGL wheel matching your torch/CUDA stack for CHGNet/QET models.
-# Example from MatGL docs (adjust for your torch/CUDA):
-python -m pip install dgl -f https://data.dgl.ai/wheels/torch-2.4/repo.html
+python -m pip install "fairchem-core==2.15.0" matgl
+# Install a DGL wheel matching your active torch/CUDA stack for CHGNet/QET models.
+# For fairchem-core 2.15.0, torch~=2.8.0 is expected.
+# Follow MatGL + DGL install docs to pick the correct wheel URL for your platform.
+python -m pip install "dgl>=2.2.0,<2.5"
 python -m pip install -e .
 ```
+
+Expected UMA package line after install: `fairchem-core 2.15.0`.
+
+Dependency compatibility note:
+
+- This project now aligns with `fairchem-core==2.15.0` and MatGL (`numpy>=2.0,<2.4`, `torch~=2.8.0`).
+- Packages that still require `numpy<2` (for example, some older diffusion-analysis packages) must be installed in a separate environment.
 
 For MPID-based structure loading, set `MP_API_KEY` in your environment.
 
