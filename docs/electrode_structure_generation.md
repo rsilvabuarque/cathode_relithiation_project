@@ -14,6 +14,12 @@ Rattling can be performed with three alternatives:
 - UMA MLFF molecular dynamics (`fairchem-core>=2.15.0`, `omat` default task)
 - MatGL MLFF molecular dynamics (`CHGNet-MatPES-PBE-2025.2.10-2.7M-PES` default model)
 
+Temporary runtime note:
+
+- MatGL rattling is currently deactivated in the pipeline to preserve stable operation with `fairchem-core>=2.15.0` in a single environment.
+- `--rattle-engine all` currently executes hiPhive + UMA only.
+- MatGL code remains in the codebase and can be re-enabled once environment compatibility is finalized.
+
 ## Current implementation defaults
 
 The list below reflects the active defaults in `SamplingConfig` and pipeline CLI wiring.

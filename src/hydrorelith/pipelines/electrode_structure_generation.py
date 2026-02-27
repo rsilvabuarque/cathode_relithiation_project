@@ -24,6 +24,8 @@ from pymatgen.io.ase import AseAtomsAdaptor
 from hydrorelith.config.defaults import default_electrode_generation_config
 from hydrorelith.config.schemas import ElectrodeGenerationConfig
 
+MATGL_RATTLING_ENABLED = False
+
 
 @dataclass(slots=True)
 class GeneratedStructure:
@@ -292,6 +294,19 @@ class ElectrodeStructureGenerationPipeline:
         if self.config.sampling.direct_threshold_init <= 0:
             raise ValueError("--direct-threshold-init must be > 0")
 
+        if (not MATGL_RATTLING_ENABLED) and self.config.sampling.rattle_engine == "matgl":
+            raise RuntimeError(
+                "MatGL rattling is temporarily disabled due environment compatibility constraints "
+                "with fairchem-core>=2.15. Use --rattle-engine uma or --rattle-engine all "
+                "(which currently runs hiPhive+UMA)."
+            )
+
+    def _active_rattle_engines(self) -> list[str]:
+        engine = self.config.sampling.rattle_engine
+        if engine == "all":
+            return ["hiphive", "uma"] if not MATGL_RATTLING_ENABLED else ["hiphive", "uma", "matgl"]
+        return [engine]
+
     def prepare_output_layout(self) -> None:
         self.config.output.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -467,10 +482,10 @@ class ElectrodeStructureGenerationPipeline:
         return sum(1 for site in structure if site.specie.symbol == ion_symbol)
 
     def _planned_engine_targets(self, total_target_count: int) -> dict[str, int]:
-        engine = self.config.sampling.rattle_engine
-        if engine == "all":
-            return self._split_counts(["hiphive", "uma", "matgl"], total_target_count)
-        return {engine: total_target_count}
+        engines = self._active_rattle_engines()
+        if len(engines) > 1:
+            return self._split_counts(engines, total_target_count)
+        return {engines[0]: total_target_count}
 
     def _planned_bin_targets(
         self,
@@ -621,6 +636,12 @@ class ElectrodeStructureGenerationPipeline:
         if target_count is None:
             target_count = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
         engine = self.config.sampling.rattle_engine
+        if engine == "all" and not MATGL_RATTLING_ENABLED:
+            counts = self._split_counts(["hiphive", "uma"], target_count)
+            combined: list[GeneratedStructure] = []
+            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, counts["hiphive"]))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["uma"], backend="uma"))
+            return combined
 
         if engine == "hiphive":
             return self._generate_rattled_candidates_hiphive(structures, temperatures, target_count)
@@ -977,9 +998,21 @@ class ElectrodeStructureGenerationPipeline:
     def _run_matgl_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
         import matgl
         from ase.io.trajectory import Trajectory
-        from matgl.ext.ase import MolecularDynamics
 
         self._ensure_matgl_backend(matgl)
+        backend_setting = self.config.sampling.matgl_backend.lower()
+        if backend_setting == "auto":
+            model_name = self.config.sampling.matgl_model_name
+            backend_setting = "dgl" if any(
+                token in model_name
+                for token in ("CHGNet", "QET", "TensorNetDGL")
+            ) else "pyg"
+
+        if backend_setting == "dgl":
+            from matgl.ext._ase_dgl import MolecularDynamics
+        else:
+            from matgl.ext.ase import MolecularDynamics
+
         potential = self._load_matgl_potential(matgl)
 
         del seed
@@ -1222,9 +1255,7 @@ class ElectrodeStructureGenerationPipeline:
         slurm_dir = getattr(self, "slurm_dir", None) or (self.config.output.output_dir / "slurm_jobs")
         slurm_dir.mkdir(parents=True, exist_ok=True)
 
-        engines = [self.config.sampling.rattle_engine]
-        if self.config.sampling.rattle_engine == "all":
-            engines = ["hiphive", "uma", "matgl"]
+        engines = self._active_rattle_engines()
 
         md_engines = [engine for engine in engines if engine in {"uma", "matgl"}]
 

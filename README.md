@@ -67,6 +67,7 @@ Inputs accepted by the scaffold:
 - Lithiation step for planned bins (default `0.05`)
 - Maximum random ion-removal combinations per lithiation bin (default `200`)
 - Rattle engine (`hiphive`, `uma`, `matgl`, or `all`; default `hiphive`)
+  - Temporary behavior: MatGL rattling is currently deactivated; `all` runs hiPhive + UMA.
 - For `hiphive`, rattle method (`mc`, `gaussian`, or `phonon`, default `mc`)
 - Rattles per base structure (default `1`)
 - Rattle amplitude at 300 K (default `0.01`, scales as $\sqrt{T/300}$)
@@ -76,6 +77,7 @@ Inputs accepted by the scaffold:
 - Per-temperature and per-lithiation progress bars during rattling
 - MLFF-MD options for UMA (`fairchem`) and MatGL with NVT/NPT controls
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
+- MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
 - Temperature strategy:
   - Fixed list default: `[250, 300, 600, 900, 1200]` K
