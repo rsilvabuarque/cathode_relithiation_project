@@ -72,7 +72,7 @@ Additional runtime outputs enabled by default:
   - `<output_dir>/md_runtime_stats/md_progress_matgl.json`
   - for UMA NPT bins, `md_progress_uma.json` includes `pressure_mpa`
 - per-run MD trajectories and property logs:
-  - `<output_dir>/md_runs/engine_<backend>/T_<temp>K/lith_<percent>pct/base_<candidate>.traj`
+  - `<output_dir>/md_runs/engine_<backend>/T_<temp>K/lith_<percent>pct/base_<candidate>.extxyz` (OVITO-readable)
   - `<output_dir>/md_runs/engine_<backend>/T_<temp>K/lith_<percent>pct/base_<candidate>_properties.csv`
 - hiPhive/MD progress bars report base runs left and ETA from moving-average base runtime
 - final selected training structures are written to `<output_dir>/best_training_set/`

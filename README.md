@@ -150,10 +150,11 @@ Per-run MD artifacts are saved under:
 ```text
 <output_dir>/md_runs/
 └── engine_<backend>/T_<temp>K/lith_<percent>pct/
-  ├── base_<candidate_index>.traj
+  ├── base_<candidate_index>.extxyz
   └── base_<candidate_index>_properties.csv
 ```
 
+Trajectory files are written in OVITO-readable EXTXYZ format.
 The properties log includes step, temperature, pressure, kinetic energy, potential energy, and total energy (UMA runs).
 
 If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:

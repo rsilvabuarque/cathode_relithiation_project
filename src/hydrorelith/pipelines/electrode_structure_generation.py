@@ -45,7 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mpid", type=str, default=None)
     parser.add_argument("--target-ion", type=str, default="Li")
     parser.add_argument("--supercell", type=int, nargs=3, default=(3, 3, 3))
-    parser.add_argument("--output-dir", type=Path, default=Path("electrode_structures"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("electrode_structures"),
+        help=(
+            "Root output folder. Per-run MD artifacts are written under "
+            "<output-dir>/md_runs/engine_<backend>/T_<temp>K/lith_<percent>pct/ "
+            "as OVITO-readable EXTXYZ trajectories plus properties CSV logs."
+        ),
+    )
     parser.add_argument("--output-format", choices=["poscar", "cif"], default="poscar")
     parser.add_argument("--max-structures", type=int, default=600)
     parser.add_argument("--oversampling-factor", type=int, default=10)
@@ -1116,7 +1125,7 @@ class ElectrodeStructureGenerationPipeline:
         run_dir = self._md_run_dir_for_bin(engine, temperature, lithiation)
         run_dir.mkdir(parents=True, exist_ok=True)
         stem = f"base_{base_candidate_index:08d}"
-        traj_path = run_dir / f"{stem}.traj"
+        traj_path = run_dir / f"{stem}.extxyz"
         log_path = run_dir / f"{stem}_properties.csv"
         return traj_path, log_path
 
@@ -1168,7 +1177,7 @@ class ElectrodeStructureGenerationPipeline:
         progress_callback=None,
     ):
         from ase import units
-        from ase.io.trajectory import Trajectory
+        from ase.io import write
         from ase.md.langevin import Langevin
         from ase.md.nptberendsen import NPTBerendsen
         from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -1191,6 +1200,8 @@ class ElectrodeStructureGenerationPipeline:
             lithiation=lithiation,
             base_candidate_index=base_candidate_index,
         )
+        if traj_path.exists():
+            traj_path.unlink()
         sample_interval = int(self.config.sampling.md_sample_interval)
         log_file = prop_log_path.open("w", encoding="utf-8")
         log_file.write(
@@ -1222,11 +1233,10 @@ class ElectrodeStructureGenerationPipeline:
 
         snapshots = []
         step_counter = {"value": 0}
-        traj_writer = Trajectory(str(traj_path), "w", atoms)
 
         def _capture():
             snapshots.append(atoms.copy())
-            traj_writer.write(atoms)
+            write(str(traj_path), atoms, format="extxyz", append=True)
 
         def _log_properties():
             try:
@@ -1265,7 +1275,6 @@ class ElectrodeStructureGenerationPipeline:
         try:
             dyn.run(steps=n_steps)
         finally:
-            traj_writer.close()
             log_file.close()
         return self._select_even_snapshots(snapshots, n_structures, seed=seed)
 
@@ -1280,6 +1289,7 @@ class ElectrodeStructureGenerationPipeline:
         progress_callback=None,
     ):
         import matgl
+        from ase.io import write
         from ase.io.trajectory import Trajectory
 
         self._ensure_matgl_backend(matgl)
@@ -1304,6 +1314,11 @@ class ElectrodeStructureGenerationPipeline:
             lithiation=lithiation,
             base_candidate_index=base_candidate_index,
         )
+        if traj_path.exists():
+            traj_path.unlink()
+        native_traj_path = traj_path.with_suffix(".traj")
+        if native_traj_path.exists():
+            native_traj_path.unlink()
 
         n_steps = self._required_md_steps(n_structures)
         md = MolecularDynamics(
@@ -1313,7 +1328,7 @@ class ElectrodeStructureGenerationPipeline:
             temperature=float(temperature),
             timestep=float(self.config.sampling.md_timestep_fs),
             friction=float(self.config.sampling.md_friction_per_fs),
-            trajectory=str(traj_path),
+            trajectory=str(native_traj_path),
             logfile=str(log_path),
             loginterval=int(self.config.sampling.md_sample_interval),
         )
@@ -1334,8 +1349,10 @@ class ElectrodeStructureGenerationPipeline:
                     md_steps_total=n_steps,
                 )
 
-        with Trajectory(str(traj_path)) as traj:
+        with Trajectory(str(native_traj_path)) as traj:
             snapshots = [frame.copy() for frame in traj]
+        for frame in snapshots:
+            write(str(traj_path), frame, format="extxyz", append=True)
 
         return self._select_even_snapshots(snapshots, n_structures, seed=seed)
 
