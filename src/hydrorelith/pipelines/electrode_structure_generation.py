@@ -71,7 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--md-friction-per-fs", type=float, default=0.001)
     parser.add_argument("--uma-model-name", type=str, default="uma-s-1p1")
     parser.add_argument("--uma-task-id", type=str, default="omat")
-    parser.add_argument("--uma-device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--uma-device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="UMA compute device (defaults to cuda when not provided).",
+    )
     parser.add_argument(
         "--matgl-model-name",
         type=str,
@@ -166,7 +171,7 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.md_friction_per_fs = args.md_friction_per_fs
     config.sampling.uma_model_name = args.uma_model_name
     config.sampling.uma_task_id = args.uma_task_id
-    config.sampling.uma_device = args.uma_device
+    config.sampling.uma_device = args.uma_device or "cuda"
     config.sampling.matgl_model_name = args.matgl_model_name
     config.sampling.matgl_backend = args.matgl_backend
     config.sampling.rattle_method = args.rattle_method
@@ -816,7 +821,19 @@ class ElectrodeStructureGenerationPipeline:
         except Exception:
             tqdm = None
 
-        self._init_md_runtime_stats(backend=backend, target_count=target_count, target_per_bin=target_per_bin)
+        pressure_per_bin: dict[tuple[int, float], float | None] | None = None
+        if backend == "uma" and self.config.sampling.md_ensemble == "npt":
+            pressure_per_bin = {
+                (temperature, lithiation): self._pressure_mpa_for_temperature(temperature)
+                for (temperature, lithiation) in bins
+            }
+
+        self._init_md_runtime_stats(
+            backend=backend,
+            target_count=target_count,
+            target_per_bin=target_per_bin,
+            pressure_per_bin=pressure_per_bin,
+        )
 
         for temperature in sorted({b[0] for b in bins}):
             for lithiation in sorted({b[1] for b in bins if b[0] == temperature}, reverse=True):
@@ -1159,6 +1176,7 @@ class ElectrodeStructureGenerationPipeline:
         backend: str,
         target_count: int,
         target_per_bin: dict[tuple[int, float], int],
+        pressure_per_bin: dict[tuple[int, float], float | None] | None = None,
     ) -> None:
         now = time.time()
         self._md_runtime_state = getattr(self, "_md_runtime_state", {})
@@ -1177,6 +1195,11 @@ class ElectrodeStructureGenerationPipeline:
                 f"T{t}_lith_{l:.6f}": {
                     "temperature_k": int(t),
                     "lithiation_fraction": float(l),
+                    "pressure_mpa": (
+                        float(pressure_per_bin[(t, l)])
+                        if pressure_per_bin is not None and pressure_per_bin.get((t, l)) is not None
+                        else None
+                    ),
                     "target_structures": int(n),
                     "completed_structures": 0,
                     "base_index": 0,

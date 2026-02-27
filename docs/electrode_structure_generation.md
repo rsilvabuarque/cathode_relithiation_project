@@ -47,6 +47,7 @@ The list below reflects the active defaults in `SamplingConfig` and pipeline CLI
   - md execution mode: `run`
   - ensemble: `nvt`
   - for UMA with `ensemble=npt`, pressure is applied per temperature from `temperature.pressures_mpa` (defaults to `0.1 MPa` if omitted)
+  - UMA device default: `cuda` when `--uma-device` is not provided
   - timestep: `1.0 fs`
   - steps: `500`
   - sample interval: `10`
@@ -66,6 +67,7 @@ Additional runtime outputs enabled by default:
 - live MD runtime stats per backend:
   - `<output_dir>/md_runtime_stats/md_progress_uma.json`
   - `<output_dir>/md_runtime_stats/md_progress_matgl.json`
+  - for UMA NPT bins, `md_progress_uma.json` includes `pressure_mpa`
 
 ## Defaults for hydrothermal relithiation
 

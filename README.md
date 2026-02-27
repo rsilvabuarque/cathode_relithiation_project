@@ -76,6 +76,7 @@ Inputs accepted by the scaffold:
 - Optional phonon-rattle mode (`rattle_method=phonon`) if `phonon_fc2_path` is provided
 - Per-temperature and per-lithiation progress bars during rattling
 - MLFF-MD options for UMA (`fairchem`) and MatGL with NVT/NPT controls
+- UMA device defaults to GPU (`--uma-device cuda`) when not provided
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
@@ -125,6 +126,7 @@ Real-time MD progress/ETA outputs (updated during UMA/MatGL runs):
 ```
 
 These files track completed structures, current bin progress, effective generation rate, ETA to completion, and failure state (`status=failed`, `error_message`) if an MD backend exits with an exception.
+For UMA with NPT, each bin also records `pressure_mpa` in `md_progress_uma.json`.
 
 If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:
 
