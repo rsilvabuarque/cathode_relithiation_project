@@ -48,10 +48,35 @@ cathode_relithiation_project/
 │       │   └── schemas.py
 │       └── pipelines/
 │           ├── __init__.py
-│           └── electrode_structure_generation.py
+│           ├── electrode_structure_generation.py
+│           └── electrolyte_structure_generation.py
 └── for_chat_gpt/
     └── user-provided context files only
 ```
+
+## Electrolyte structure generation (amorphous builder + optional rattling)
+
+New command:
+
+```bash
+hrw-electrolyte-generate --help
+```
+
+Key inputs are provided explicitly on CLI for reproducibility:
+
+- solvent template: `--solvent name=path`
+- ion templates: `--li-template`, `--k-template`, `--oh-template` (all in `name=path` format)
+- concentration grid: `--li-k-concentrations "4/0,3.5/0.5,...,0/4"` (LiOH/KOH in mol/kg-solvent)
+- build constraints: `--max-atoms` and `--structures-per-concentration`
+- solvent density: `--solvent-density-g-cm3` (auto defaults to `1.0` for water-like solvent names)
+
+The pipeline:
+
+1. Builds amorphous cubic structures near target molalities while respecting max atoms.
+2. Writes generation summary to `<output_dir>/electrolyte_generation_overview.json`.
+3. Optionally applies hiPhive rattling or UMA-MD and then DIRECT down-selection.
+
+For quick generation-only checks, use `--skip-rattling`.
 
 ## Electrode structure generation (scaffold)
 

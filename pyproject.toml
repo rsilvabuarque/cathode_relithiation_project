@@ -37,6 +37,7 @@ dev = [
 [project.scripts]
 hrw = "hydrorelith.cli:main"
 hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:main"
+hrw-electrolyte-generate = "hydrorelith.pipelines.electrolyte_structure_generation:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

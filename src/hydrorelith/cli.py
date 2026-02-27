@@ -14,6 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
         "electrode-generate",
         help="Scaffold command for electrode structure generation workflow.",
     )
+    subparsers.add_parser(
+        "electrolyte-generate",
+        help="Scaffold command for electrolyte structure generation workflow.",
+    )
     return parser
 
 
@@ -24,6 +28,10 @@ def main() -> None:
     if args.command == "electrode-generate":
         raise NotImplementedError(
             "Use `hrw-electrode-generate` for the dedicated scaffold command."
+        )
+    if args.command == "electrolyte-generate":
+        raise NotImplementedError(
+            "Use `hrw-electrolyte-generate` for the dedicated scaffold command."
         )
 
     parser.print_help()
