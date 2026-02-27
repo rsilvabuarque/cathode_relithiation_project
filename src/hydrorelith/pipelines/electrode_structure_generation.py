@@ -985,6 +985,8 @@ class ElectrodeStructureGenerationPipeline:
                             snapshots = self._run_uma_md_snapshots(
                                 atoms,
                                 temperature,
+                                lithiation,
+                                base_item.candidate_index,
                                 n_structures,
                                 seed,
                                 pressure_mpa=pressure_mpa,
@@ -994,6 +996,8 @@ class ElectrodeStructureGenerationPipeline:
                             snapshots = self._run_matgl_md_snapshots(
                                 atoms,
                                 temperature,
+                                lithiation,
+                                base_item.candidate_index,
                                 n_structures,
                                 seed,
                                 progress_callback=_progress_callback,
@@ -1093,6 +1097,29 @@ class ElectrodeStructureGenerationPipeline:
             / self._format_lithiation_dir(lithiation)
         )
 
+    def _md_run_dir_for_bin(self, engine: str, temperature: int, lithiation: float) -> Path:
+        return (
+            self.config.output.output_dir
+            / "md_runs"
+            / f"engine_{engine}"
+            / f"T_{temperature}K"
+            / self._format_lithiation_dir(lithiation)
+        )
+
+    def _md_run_output_paths(
+        self,
+        engine: str,
+        temperature: int,
+        lithiation: float,
+        base_candidate_index: int,
+    ) -> tuple[Path, Path]:
+        run_dir = self._md_run_dir_for_bin(engine, temperature, lithiation)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"base_{base_candidate_index:08d}"
+        traj_path = run_dir / f"{stem}.traj"
+        log_path = run_dir / f"{stem}_properties.csv"
+        return traj_path, log_path
+
     def _cache_snapshot_paths(
         self,
         engine: str,
@@ -1133,12 +1160,15 @@ class ElectrodeStructureGenerationPipeline:
         self,
         atoms,
         temperature: int,
+        lithiation: float,
+        base_candidate_index: int,
         n_structures: int,
         seed: int,
         pressure_mpa: float | None = None,
         progress_callback=None,
     ):
         from ase import units
+        from ase.io.trajectory import Trajectory
         from ase.md.langevin import Langevin
         from ase.md.nptberendsen import NPTBerendsen
         from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -1154,6 +1184,18 @@ class ElectrodeStructureGenerationPipeline:
         atoms.calc = FAIRChemCalculator(self._uma_predictor, task_name=self.config.sampling.uma_task_id)
         MaxwellBoltzmannDistribution(atoms, temperature_K=float(temperature), rng=np.random.default_rng(seed))
         Stationary(atoms)
+
+        traj_path, prop_log_path = self._md_run_output_paths(
+            engine="uma",
+            temperature=temperature,
+            lithiation=lithiation,
+            base_candidate_index=base_candidate_index,
+        )
+        sample_interval = int(self.config.sampling.md_sample_interval)
+        log_file = prop_log_path.open("w", encoding="utf-8")
+        log_file.write(
+            "step,temperature_K,pressure_GPa,kinetic_energy_eV,potential_energy_eV,total_energy_eV\n"
+        )
 
         timestep = self.config.sampling.md_timestep_fs * units.fs
         if self.config.sampling.md_ensemble == "npt":
@@ -1179,16 +1221,35 @@ class ElectrodeStructureGenerationPipeline:
             )
 
         snapshots = []
+        step_counter = {"value": 0}
+        traj_writer = Trajectory(str(traj_path), "w", atoms)
 
         def _capture():
             snapshots.append(atoms.copy())
+            traj_writer.write(atoms)
 
-        dyn.attach(_capture, interval=self.config.sampling.md_sample_interval)
+        def _log_properties():
+            try:
+                stress = atoms.get_stress(voigt=True)
+                pressure_gpa = -float(np.mean(stress[:3])) / units.GPa
+            except Exception:
+                pressure_gpa = float("nan")
+
+            kinetic = float(atoms.get_kinetic_energy())
+            potential = float(atoms.get_potential_energy())
+            total = kinetic + potential
+            temperature_k = float(atoms.get_temperature())
+            log_file.write(
+                f"{step_counter['value']},{temperature_k:.8f},{pressure_gpa:.8f},{kinetic:.8f},{potential:.8f},{total:.8f}\n"
+            )
+            log_file.flush()
+            step_counter["value"] += sample_interval
+
+        dyn.attach(_capture, interval=sample_interval)
+        dyn.attach(_log_properties, interval=sample_interval)
         n_steps = self._required_md_steps(n_structures)
 
         if progress_callback is not None:
-            sample_interval = self.config.sampling.md_sample_interval
-
             def _progress_hook():
                 captured = len(snapshots)
                 done_steps = min(n_steps, captured * sample_interval)
@@ -1201,10 +1262,23 @@ class ElectrodeStructureGenerationPipeline:
 
             dyn.attach(_progress_hook, interval=sample_interval)
 
-        dyn.run(steps=n_steps)
+        try:
+            dyn.run(steps=n_steps)
+        finally:
+            traj_writer.close()
+            log_file.close()
         return self._select_even_snapshots(snapshots, n_structures, seed=seed)
 
-    def _run_matgl_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+    def _run_matgl_md_snapshots(
+        self,
+        atoms,
+        temperature: int,
+        lithiation: float,
+        base_candidate_index: int,
+        n_structures: int,
+        seed: int,
+        progress_callback=None,
+    ):
         import matgl
         from ase.io.trajectory import Trajectory
 
@@ -1224,11 +1298,12 @@ class ElectrodeStructureGenerationPipeline:
 
         potential = self._load_matgl_potential(matgl)
 
-        tmp_dir = self.config.output.output_dir / "_tmp_md"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        token = random.randint(10_000, 99_999)
-        traj_path = tmp_dir / f"matgl_T{temperature}_{token}.traj"
-        log_path = tmp_dir / f"matgl_T{temperature}_{token}.log"
+        traj_path, log_path = self._md_run_output_paths(
+            engine="matgl",
+            temperature=temperature,
+            lithiation=lithiation,
+            base_candidate_index=base_candidate_index,
+        )
 
         n_steps = self._required_md_steps(n_structures)
         md = MolecularDynamics(

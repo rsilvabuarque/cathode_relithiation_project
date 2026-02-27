@@ -145,6 +145,17 @@ These files track completed structures, current bin progress, effective generati
 For UMA with NPT, each bin also records `pressure_mpa` in `md_progress_uma.json`.
 hiPhive and MD progress bars report base runs left for the current (temperature, lithiation) bin plus ETA from a moving average of recent base-run durations.
 
+Per-run MD artifacts are saved under:
+
+```text
+<output_dir>/md_runs/
+└── engine_<backend>/T_<temp>K/lith_<percent>pct/
+  ├── base_<candidate_index>.traj
+  └── base_<candidate_index>_properties.csv
+```
+
+The properties log includes step, temperature, pressure, kinetic energy, potential energy, and total energy (UMA runs).
+
 If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:
 
 ```text
