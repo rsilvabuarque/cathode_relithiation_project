@@ -77,7 +77,7 @@ Inputs accepted by the scaffold:
 - Per-temperature and per-lithiation progress bars during rattling
 - MLFF-MD options for UMA (`fairchem`) and MatGL with NVT/NPT controls
 - UMA device defaults to GPU (`--uma-device cuda`) when not provided
-- MD frame selection keeps a random fraction of sampled snapshots (`--md-frame-select-fraction`, default `0.25`)
+- MD frame selection keeps a random fraction of sampled snapshots (`--md-frame-select-fraction`, default `0.10`)
 - MD run length enforces at least 4× sampled snapshots before selection (`--md-min-step-multiplier`, default `4.0`)
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
@@ -93,6 +93,9 @@ Generation strategy:
 - Use one representative for 100% lithiated and single-vacancy states.
 - Oversample pool by default to `10x` final target.
 - Apply rattling via selected engine: hiPhive, UMA MD, MatGL MD, or all three.
+- In `--rattle-engine all` mode, each active engine now generates a full pre-DIRECT pool (`max_structures * oversampling_factor`) instead of splitting that pool across engines.
+- For `all` mode, three DIRECT candidates are evaluated: `hiphive`-only, `uma`-only, and `combined`; each produces a 600-structure training set (for default `max_structures=600`).
+- The best option (highest mean DIRECT coverage score) is written to `<output_dir>/best_training_set/`.
 - Apply `maml`-style DIRECT sampling to down-select robust training structures.
 - Use `--skip-direct` if you need to emit the full pre-DIRECT pool.
 - Preserve user-defined sampling ratios across lithiation bins and temperature bins.
@@ -105,6 +108,16 @@ DIRECT plotting outputs are written to:
 ├── pca_coverage_direct.png
 ├── pca_coverage_manual.png
 └── coverage_scores.png
+```
+
+In `all` mode, per-option metrics are written under:
+
+```text
+<output_dir>/direct_metrics/
+├── option_hiphive/
+├── option_uma/
+├── option_combined/
+└── training_set_comparison.json
 ```
 
 Upfront generation overview (written before rattling starts):

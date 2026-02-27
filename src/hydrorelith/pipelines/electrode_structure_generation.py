@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--md-frame-select-fraction",
         type=float,
-        default=0.25,
+        default=0.10,
         help="Fraction of sampled MD snapshots retained after run (random selection).",
     )
     parser.add_argument(
@@ -244,9 +244,12 @@ class ElectrodeStructureGenerationPipeline:
         if getattr(self, "skip_direct", False):
             output_structures = rattled_candidates
         else:
-            output_structures = self.select_with_direct(rattled_candidates)
-            if self.config.sampling.direct_plot_metrics:
-                self.plot_direct_metrics(rattled_candidates, output_structures)
+            if self.config.sampling.rattle_engine == "all":
+                output_structures = self._select_best_training_set_from_all_mode(rattled_candidates)
+            else:
+                output_structures = self.select_with_direct(rattled_candidates)
+                if self.config.sampling.direct_plot_metrics:
+                    self.plot_direct_metrics(rattled_candidates, output_structures)
         self.write_structures(output_structures)
 
     def bootstrap_output_tree(self) -> None:
@@ -510,6 +513,8 @@ class ElectrodeStructureGenerationPipeline:
 
     def _planned_engine_targets(self, total_target_count: int) -> dict[str, int]:
         engines = self._active_rattle_engines()
+        if self.config.sampling.rattle_engine == "all":
+            return {engine: total_target_count for engine in engines}
         if len(engines) > 1:
             return self._split_counts(engines, total_target_count)
         return {engines[0]: total_target_count}
@@ -548,6 +553,7 @@ class ElectrodeStructureGenerationPipeline:
             target_total = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
 
         engine_targets = self._planned_engine_targets(target_total)
+        combined_target_total = int(sum(engine_targets.values()))
         rattling_by_engine: dict[str, dict] = {}
         for engine_name, engine_target in engine_targets.items():
             bin_targets = self._planned_bin_targets(
@@ -586,7 +592,7 @@ class ElectrodeStructureGenerationPipeline:
             "rattling_plan": {
                 "rattle_engine": self.config.sampling.rattle_engine,
                 "md_execution": self.config.sampling.md_execution,
-                "target_pool_structures": int(target_total),
+                "target_pool_structures": combined_target_total,
                 "engines": rattling_by_engine,
             },
             "temperatures_k": [int(t) for t in temperatures],
@@ -664,10 +670,9 @@ class ElectrodeStructureGenerationPipeline:
             target_count = self.config.sampling.max_structures * self.config.sampling.oversampling_factor
         engine = self.config.sampling.rattle_engine
         if engine == "all" and not MATGL_RATTLING_ENABLED:
-            counts = self._split_counts(["hiphive", "uma"], target_count)
             combined: list[GeneratedStructure] = []
-            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, counts["hiphive"]))
-            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["uma"], backend="uma"))
+            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, target_count))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="uma"))
             return combined
 
         if engine == "hiphive":
@@ -677,11 +682,10 @@ class ElectrodeStructureGenerationPipeline:
         if engine == "matgl":
             return self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="matgl")
         if engine == "all":
-            counts = self._split_counts(["hiphive", "uma", "matgl"], target_count)
             combined: list[GeneratedStructure] = []
-            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, counts["hiphive"]))
-            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["uma"], backend="uma"))
-            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, counts["matgl"], backend="matgl"))
+            combined.extend(self._generate_rattled_candidates_hiphive(structures, temperatures, target_count))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="uma"))
+            combined.extend(self._generate_rattled_candidates_mlff_md(structures, temperatures, target_count, backend="matgl"))
             return combined
 
         raise ValueError(f"Unsupported rattle engine: {engine}")
@@ -1540,10 +1544,117 @@ class ElectrodeStructureGenerationPipeline:
             selected.extend(remaining[i] for i in fill)
         return selected[:n_select]
 
+    def _direct_mean_coverage_score(
+        self,
+        all_structures: list[GeneratedStructure],
+        selected_structures: list[GeneratedStructure],
+    ) -> float:
+        if not all_structures or not selected_structures:
+            return 0.0
+
+        all_features = np.array([self._compute_descriptor(item) for item in all_structures], dtype=float)
+        selected_features = np.array([self._compute_descriptor(item) for item in selected_structures], dtype=float)
+
+        selected_indexes: list[int] = []
+        used = set()
+        for sf in selected_features:
+            candidates = np.where(np.all(np.isclose(all_features, sf, atol=1e-8), axis=1))[0]
+            for idx in candidates:
+                if idx not in used:
+                    selected_indexes.append(int(idx))
+                    used.add(int(idx))
+                    break
+
+        if not selected_indexes:
+            return 0.0
+
+        from sklearn.decomposition import PCA
+
+        n_components = min(30, all_features.shape[0], all_features.shape[1])
+        pca = PCA(n_components=n_components)
+        pca_features = pca.fit_transform(all_features)
+        weighted = pca_features[:, : min(7, pca_features.shape[1])]
+        n_pcs_score = min(7, weighted.shape[1])
+        if n_pcs_score <= 0:
+            return 0.0
+
+        scores_direct = [
+            self._coverage_score(weighted[:, i], selected_indexes, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+        return float(np.mean(scores_direct))
+
+    def _select_best_training_set_from_all_mode(
+        self,
+        rattled_candidates: list[GeneratedStructure],
+    ) -> list[GeneratedStructure]:
+        engine_pools: dict[str, list[GeneratedStructure]] = {
+            engine: [item for item in rattled_candidates if item.source_engine == engine]
+            for engine in self._active_rattle_engines()
+        }
+        option_pools: dict[str, list[GeneratedStructure]] = {
+            **engine_pools,
+            "combined": rattled_candidates,
+        }
+
+        comparison: dict[str, dict] = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "options": {},
+        }
+        selected_by_option: dict[str, list[GeneratedStructure]] = {}
+        options_dir = self.config.output.output_dir / "training_set_options"
+        metrics_root = self.config.output.output_dir / "direct_metrics"
+        metrics_root.mkdir(parents=True, exist_ok=True)
+
+        for option_name, pool in option_pools.items():
+            if not pool:
+                comparison["options"][option_name] = {
+                    "pool_size": 0,
+                    "selected_size": 0,
+                    "direct_mean_coverage_score": 0.0,
+                }
+                continue
+
+            selected = self.select_with_direct(pool)
+            selected_by_option[option_name] = selected
+            score = self._direct_mean_coverage_score(pool, selected)
+            comparison["options"][option_name] = {
+                "pool_size": int(len(pool)),
+                "selected_size": int(len(selected)),
+                "direct_mean_coverage_score": float(score),
+            }
+
+            option_dir = options_dir / option_name
+            self.write_structures(selected, base_dir=option_dir, include_engine_subdirs=False)
+
+            if self.config.sampling.direct_plot_metrics:
+                self.plot_direct_metrics(pool, selected, metrics_dir=metrics_root / f"option_{option_name}")
+
+        if not selected_by_option:
+            raise RuntimeError("No candidate pools available for all-mode DIRECT comparison.")
+
+        best_option = max(
+            selected_by_option.keys(),
+            key=lambda name: comparison["options"][name]["direct_mean_coverage_score"],
+        )
+        best_structures = selected_by_option[best_option]
+        comparison["best_option"] = best_option
+
+        best_dir = self.config.output.output_dir / "best_training_set"
+        self.write_structures(best_structures, base_dir=best_dir, include_engine_subdirs=False)
+
+        summary_path = metrics_root / "training_set_comparison.json"
+        summary_path.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+        print(
+            f"[DIRECT all-mode] best option={best_option}, score={comparison['options'][best_option]['direct_mean_coverage_score']:.4f}"
+        )
+        return best_structures
+
     def plot_direct_metrics(
         self,
         all_structures: list[GeneratedStructure],
         selected_structures: list[GeneratedStructure],
+        metrics_dir: Path | None = None,
     ) -> None:
         if not all_structures or not selected_structures:
             return
@@ -1561,7 +1672,7 @@ class ElectrodeStructureGenerationPipeline:
                     used.add(int(idx))
                     break
 
-        metrics_dir = self.config.output.output_dir / "direct_metrics"
+        metrics_dir = metrics_dir or (self.config.output.output_dir / "direct_metrics")
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
         from sklearn.decomposition import PCA
@@ -1785,21 +1896,33 @@ class ElectrodeStructureGenerationPipeline:
             d2_min[selected] = -1.0
         return selected
 
-    def write_structures(self, structures: list[GeneratedStructure]) -> None:
+    def write_structures(
+        self,
+        structures: list[GeneratedStructure],
+        base_dir: Path | None = None,
+        include_engine_subdirs: bool | None = None,
+    ) -> None:
         if not structures:
             return
 
-        if structures[0].temperature_k is None:
-            base_dir = self.config.output.output_dir / "delithiation_candidates"
-        else:
-            base_dir = self.config.output.output_dir
+        if base_dir is None:
+            if structures[0].temperature_k is None:
+                base_dir = self.config.output.output_dir / "delithiation_candidates"
+            else:
+                base_dir = self.config.output.output_dir
+
+        if include_engine_subdirs is None:
+            include_engine_subdirs = self.config.sampling.rattle_engine == "all"
+
+        if structures[0].temperature_k is None and base_dir.name != "delithiation_candidates":
+            base_dir = base_dir / "delithiation_candidates"
 
         for idx, item in enumerate(structures, start=1):
             lith_dir_name = self._format_lithiation_dir(item.lithiation_fraction)
             if item.temperature_k is None:
                 target_dir = base_dir / lith_dir_name
             else:
-                if self.config.sampling.rattle_engine == "all" and item.source_engine is not None:
+                if include_engine_subdirs and item.source_engine is not None:
                     target_dir = (
                         base_dir
                         / f"engine_{item.source_engine}"

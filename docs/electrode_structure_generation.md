@@ -48,7 +48,7 @@ The list below reflects the active defaults in `SamplingConfig` and pipeline CLI
   - ensemble: `nvt`
   - for UMA with `ensemble=npt`, pressure is applied per temperature from `temperature.pressures_mpa` (defaults to `0.1 MPa` if omitted)
   - UMA device default: `cuda` when `--uma-device` is not provided
-  - frame retention after MD: random subset with `md_frame_select_fraction=0.25` by default
+  - frame retention after MD: random subset with `md_frame_select_fraction=0.10` by default
   - MD run length floor: at least `4x` sampled snapshots before frame selection (`md_min_step_multiplier=4.0`)
   - timestep: `1.0 fs`
   - steps: `500`
@@ -109,5 +109,6 @@ Rationale:
 - Generate rattled candidates (phonon-rattle preferred for hiPhive).
 - Generate MD-rattled candidates with UMA/MatGL as alternatives.
 - Apply DIRECT-style sampler (maml interface) under retention constraints.
+- For `rattle_engine=all`, evaluate DIRECT on three candidate pools (`hiphive`, `uma`, `combined`) and choose the best 600-structure training set by mean DIRECT coverage score.
 - Emit DIRECT quality plots (PCA coverage and feature coverage scores).
 - Export structures into temperature/lithiation directory tree.
