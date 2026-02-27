@@ -250,7 +250,8 @@ class ElectrodeStructureGenerationPipeline:
                 output_structures = self.select_with_direct(rattled_candidates)
                 if self.config.sampling.direct_plot_metrics:
                     self.plot_direct_metrics(rattled_candidates, output_structures)
-        self.write_structures(output_structures)
+        final_dir = self.config.output.output_dir / "best_training_set"
+        self.write_structures(output_structures, base_dir=final_dir, include_engine_subdirs=False)
 
     def bootstrap_output_tree(self) -> None:
         self.prepare_output_layout()
@@ -753,12 +754,19 @@ class ElectrodeStructureGenerationPipeline:
                     base_work[idx] += 1
 
                 progress_desc = f"T={temperature}K lith={lithiation*100:.2f}%"
-                pbar = tqdm(total=n_bin, desc=progress_desc, leave=False) if tqdm else None
+                pbar = tqdm(total=max_bases, desc=f"hiPhive {progress_desc}", leave=False) if tqdm else None
+                per_base_durations: list[float] = []
+                completed_bases = 0
 
                 for base_idx, base_item in enumerate(selected_bases):
                     n_structures = base_work[base_idx]
                     if n_structures <= 0:
+                        completed_bases += 1
+                        if pbar is not None:
+                            pbar.update(1)
                         continue
+
+                    start_base = time.time()
 
                     atoms = adaptor.get_atoms(base_item.structure)
                     seed = 1_000_003 * temperature + 101 * base_item.candidate_index + 17
@@ -801,13 +809,22 @@ class ElectrodeStructureGenerationPipeline:
                                 source_engine="hiphive",
                             )
                         )
+                    completed_bases += 1
+                    elapsed = max(time.time() - start_base, 1e-9)
+                    per_base_durations.append(elapsed)
+                    if len(per_base_durations) > 10:
+                        per_base_durations.pop(0)
+                    runs_left = max_bases - completed_bases
+                    avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
+                    eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                     if pbar is not None:
-                        pbar.update(len(rattled_atoms_list))
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
 
                 if pbar is not None:
                     pbar.close()
                 else:
-                    print(f"[progress] generated {n_bin} structures for {progress_desc}")
+                    print(f"[progress] hiPhive completed for {progress_desc}; base_runs={max_bases}")
 
         if len(expanded) != target_count:
             raise RuntimeError(
@@ -875,15 +892,61 @@ class ElectrodeStructureGenerationPipeline:
                     base_work[idx] += 1
 
                 progress_desc = f"{backend.upper()} MD T={temperature}K lith={lithiation*100:.2f}%"
-                pbar = tqdm(total=n_bin, desc=progress_desc, leave=False) if tqdm else None
+                pbar = tqdm(total=max_bases, desc=progress_desc, leave=False) if tqdm else None
+                per_base_durations: list[float] = []
+                completed_bases = 0
 
                 for base_idx, base_item in enumerate(selected_bases):
                     n_structures = base_work[base_idx]
                     if n_structures <= 0:
+                        completed_bases += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        continue
+
+                    cache_paths = self._cache_snapshot_paths(
+                        engine=backend,
+                        temperature=temperature,
+                        lithiation=lithiation,
+                        base_candidate_index=base_item.candidate_index,
+                        n_structures=n_structures,
+                    )
+                    cached_structures = self._load_cached_structures(cache_paths)
+                    if cached_structures is not None and len(cached_structures) == n_structures:
+                        for snap_idx, cached_structure in enumerate(cached_structures):
+                            expanded.append(
+                                GeneratedStructure(
+                                    structure=cached_structure,
+                                    lithiation_fraction=lithiation,
+                                    temperature_k=temperature,
+                                    candidate_index=base_item.candidate_index * 100_000 + snap_idx,
+                                    source_engine=backend,
+                                )
+                            )
+                        self._update_md_runtime_stats(
+                            backend=backend,
+                            temperature=temperature,
+                            lithiation=lithiation,
+                            stage="base_cached",
+                            completed_delta=len(cached_structures),
+                            base_index=base_idx + 1,
+                            base_total=max_bases,
+                            md_steps_done=0,
+                            md_steps_total=0,
+                            snapshots_captured=len(cached_structures),
+                        )
+                        completed_bases += 1
+                        runs_left = max_bases - completed_bases
+                        avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
+                        eta_seconds = (avg_time * runs_left) if avg_time is not None else None
+                        if pbar is not None:
+                            pbar.update(1)
+                            pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
                         continue
 
                     atoms = adaptor.get_atoms(base_item.structure)
                     seed = 7_000_001 * temperature + 151 * base_item.candidate_index + 19
+                    start_base = time.time()
 
                     def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
                         self._update_md_runtime_stats(
@@ -956,8 +1019,21 @@ class ElectrodeStructureGenerationPipeline:
                                 source_engine=backend,
                             )
                         )
+
+                    selected_structures = [adaptor.get_structure(snap_atoms) for snap_atoms in snapshots]
+                    self._write_cached_structures(selected_structures, cache_paths)
+
+                    completed_bases += 1
+                    elapsed = max(time.time() - start_base, 1e-9)
+                    per_base_durations.append(elapsed)
+                    if len(per_base_durations) > 10:
+                        per_base_durations.pop(0)
+                    runs_left = max_bases - completed_bases
+                    avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
+                    eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                     if pbar is not None:
-                        pbar.update(len(snapshots))
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
 
                     self._update_md_runtime_stats(
                         backend=backend,
@@ -975,7 +1051,7 @@ class ElectrodeStructureGenerationPipeline:
                 if pbar is not None:
                     pbar.close()
                 else:
-                    print(f"[progress] generated {n_bin} {backend} MD structures for {progress_desc}")
+                    print(f"[progress] {backend} MD completed for {progress_desc}; base_runs={max_bases}")
 
         self._finalize_md_runtime_stats(backend=backend, final_count=len(expanded), target_count=target_count)
 
@@ -1007,6 +1083,51 @@ class ElectrodeStructureGenerationPipeline:
                 "Provide --pressures-mpa aligned with --temperatures for NPT runs."
             )
         return float(pressures[temperature])
+
+    def _cache_dir_for_bin(self, engine: str, temperature: int, lithiation: float) -> Path:
+        return (
+            self.config.output.output_dir
+            / "rattling_cache"
+            / f"engine_{engine}"
+            / f"T_{temperature}K"
+            / self._format_lithiation_dir(lithiation)
+        )
+
+    def _cache_snapshot_paths(
+        self,
+        engine: str,
+        temperature: int,
+        lithiation: float,
+        base_candidate_index: int,
+        n_structures: int,
+    ) -> list[Path]:
+        cache_dir = self._cache_dir_for_bin(engine, temperature, lithiation)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return [
+            cache_dir / f"base_{base_candidate_index:08d}_snap_{snap_idx:04d}.cif"
+            for snap_idx in range(n_structures)
+        ]
+
+    def _load_cached_structures(self, paths: list[Path]) -> list[Structure] | None:
+        if not paths or not all(path.exists() for path in paths):
+            return None
+        return [Structure.from_file(str(path)) for path in paths]
+
+    def _write_cached_structures(self, structures: list[Structure], paths: list[Path]) -> None:
+        if len(structures) != len(paths):
+            raise ValueError("Cached structure count does not match target path count.")
+        for structure, path in zip(structures, paths):
+            structure.to(fmt="cif", filename=str(path))
+
+    def _eta_string(self, seconds: float | None) -> str:
+        if seconds is None or math.isinf(seconds) or math.isnan(seconds):
+            return "ETA --:--"
+        total = max(int(round(seconds)), 0)
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"ETA {hours:d}:{minutes:02d}:{secs:02d}"
+        return f"ETA {minutes:02d}:{secs:02d}"
 
     def _run_uma_md_snapshots(
         self,

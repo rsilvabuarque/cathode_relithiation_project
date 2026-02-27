@@ -50,6 +50,7 @@ The list below reflects the active defaults in `SamplingConfig` and pipeline CLI
   - UMA device default: `cuda` when `--uma-device` is not provided
   - frame retention after MD: random subset with `md_frame_select_fraction=0.10` by default
   - MD run length floor: at least `4x` sampled snapshots before frame selection (`md_min_step_multiplier=4.0`)
+  - MD reruns are resumable via cached snapshots under `<output_dir>/rattling_cache/`
   - timestep: `1.0 fs`
   - steps: `500`
   - sample interval: `10`
@@ -70,6 +71,8 @@ Additional runtime outputs enabled by default:
   - `<output_dir>/md_runtime_stats/md_progress_uma.json`
   - `<output_dir>/md_runtime_stats/md_progress_matgl.json`
   - for UMA NPT bins, `md_progress_uma.json` includes `pressure_mpa`
+- hiPhive/MD progress bars report base runs left and ETA from moving-average base runtime
+- final selected training structures are written to `<output_dir>/best_training_set/`
 
 ## Defaults for hydrothermal relithiation
 

@@ -79,6 +79,7 @@ Inputs accepted by the scaffold:
 - UMA device defaults to GPU (`--uma-device cuda`) when not provided
 - MD frame selection keeps a random fraction of sampled snapshots (`--md-frame-select-fraction`, default `0.10`)
 - MD run length enforces at least 4× sampled snapshots before selection (`--md-min-step-multiplier`, default `4.0`)
+- MD runs are resumable: completed base snapshots are cached under `<output_dir>/rattling_cache/` and reused after interruption
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
@@ -142,6 +143,7 @@ Real-time MD progress/ETA outputs (updated during UMA/MatGL runs):
 
 These files track completed structures, current bin progress, effective generation rate, ETA to completion, and failure state (`status=failed`, `error_message`) if an MD backend exits with an exception.
 For UMA with NPT, each bin also records `pressure_mpa` in `md_progress_uma.json`.
+hiPhive and MD progress bars report base runs left for the current (temperature, lithiation) bin plus ETA from a moving average of recent base-run durations.
 
 If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:
 
