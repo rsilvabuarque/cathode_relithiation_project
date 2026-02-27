@@ -397,7 +397,7 @@ class ElectrodeStructureGenerationPipeline:
             },
             "notes": [
                 "Bootstrap mode creates directory and metadata scaffold only.",
-                "Pressure values are recorded for downstream MD/thermo stages and future hiPhive coupling.",
+                "For UMA MD with --md-ensemble npt, pressures_mpa are used as target external pressure per temperature (default 0.1 MPa if omitted).",
                 "Without --skip-direct, this stage applies DIRECT selection to max_structures.",
             ],
         }
@@ -871,11 +871,17 @@ class ElectrodeStructureGenerationPipeline:
 
                     try:
                         if backend == "uma":
+                            pressure_mpa = (
+                                self._pressure_mpa_for_temperature(temperature)
+                                if self.config.sampling.md_ensemble == "npt"
+                                else None
+                            )
                             snapshots = self._run_uma_md_snapshots(
                                 atoms,
                                 temperature,
                                 n_structures,
                                 seed,
+                                pressure_mpa=pressure_mpa,
                                 progress_callback=_progress_callback,
                             )
                         elif backend == "matgl":
@@ -948,9 +954,30 @@ class ElectrodeStructureGenerationPipeline:
             raise ValueError("Bin filters produced no temperature/lithiation combinations.")
         return filtered
 
-    def _run_uma_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
+    def _pressure_mpa_for_temperature(self, temperature: int) -> float:
+        pressures = self.config.temperature.pressures_mpa
+        if not pressures:
+            return 0.1
+        if temperature not in pressures:
+            raise ValueError(
+                f"No pressure provided for temperature {temperature} K. "
+                "Provide --pressures-mpa aligned with --temperatures for NPT runs."
+            )
+        return float(pressures[temperature])
+
+    def _run_uma_md_snapshots(
+        self,
+        atoms,
+        temperature: int,
+        n_structures: int,
+        seed: int,
+        pressure_mpa: float | None = None,
+        progress_callback=None,
+    ):
         from ase import units
         from ase.md.langevin import Langevin
+        from ase.md.nptberendsen import NPTBerendsen
+        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
         if not hasattr(self, "_uma_predictor"):
@@ -961,13 +988,31 @@ class ElectrodeStructureGenerationPipeline:
 
         atoms = atoms.copy()
         atoms.calc = FAIRChemCalculator(self._uma_predictor, task_name=self.config.sampling.uma_task_id)
+        MaxwellBoltzmannDistribution(atoms, temperature_K=float(temperature), rng=np.random.default_rng(seed))
+        Stationary(atoms)
 
-        dyn = Langevin(
-            atoms,
-            timestep=self.config.sampling.md_timestep_fs * units.fs,
-            temperature_K=float(temperature),
-            friction=self.config.sampling.md_friction_per_fs / units.fs,
-        )
+        timestep = self.config.sampling.md_timestep_fs * units.fs
+        if self.config.sampling.md_ensemble == "npt":
+            target_pressure_mpa = float(
+                pressure_mpa if pressure_mpa is not None else self._pressure_mpa_for_temperature(temperature)
+            )
+            target_pressure_au = target_pressure_mpa * 1e6 * units.Pascal
+            dyn = NPTBerendsen(
+                atoms,
+                timestep=timestep,
+                temperature_K=float(temperature),
+                pressure_au=target_pressure_au,
+                taut=25.0 * units.fs,
+                taup=75.0 * units.fs,
+                compressibility=4.57e-5,
+            )
+        else:
+            dyn = Langevin(
+                atoms,
+                timestep=timestep,
+                temperature_K=float(temperature),
+                friction=self.config.sampling.md_friction_per_fs / units.fs,
+            )
 
         snapshots = []
 

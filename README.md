@@ -82,7 +82,7 @@ Inputs accepted by the scaffold:
 - Temperature strategy:
   - Fixed list default: `[250, 300, 600, 900, 1200]` K
   - Auto mode: 5 points between 250 K and 1.1 × melting temperature, forced inclusion of 300 K
-- Optional pressure list (MPa) aligned with temperature entries for condition metadata tracking
+- Optional pressure list (MPa) aligned with temperature entries; used as target external pressure for UMA when `--md-ensemble npt`
 
 Generation strategy:
 

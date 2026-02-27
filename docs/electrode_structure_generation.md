@@ -46,6 +46,7 @@ The list below reflects the active defaults in `SamplingConfig` and pipeline CLI
   - rattle engine default: `hiphive`
   - md execution mode: `run`
   - ensemble: `nvt`
+  - for UMA with `ensemble=npt`, pressure is applied per temperature from `temperature.pressures_mpa` (defaults to `0.1 MPa` if omitted)
   - timestep: `1.0 fs`
   - steps: `500`
   - sample interval: `10`
