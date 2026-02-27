@@ -40,6 +40,8 @@ class SamplingConfig:
     md_timestep_fs: float = 1.0
     md_steps: int = 500
     md_sample_interval: int = 10
+    md_frame_select_fraction: float = 0.25
+    md_min_step_multiplier: float = 4.0
     md_friction_per_fs: float = 0.001
     uma_model_name: str = "uma-s-1p1"
     uma_task_id: str = "omat"

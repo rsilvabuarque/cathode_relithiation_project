@@ -77,6 +77,8 @@ Inputs accepted by the scaffold:
 - Per-temperature and per-lithiation progress bars during rattling
 - MLFF-MD options for UMA (`fairchem`) and MatGL with NVT/NPT controls
 - UMA device defaults to GPU (`--uma-device cuda`) when not provided
+- MD frame selection keeps a random fraction of sampled snapshots (`--md-frame-select-fraction`, default `0.25`)
+- MD run length enforces at least 4× sampled snapshots before selection (`--md-min-step-multiplier`, default `4.0`)
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs

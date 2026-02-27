@@ -68,6 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--md-timestep-fs", type=float, default=1.0)
     parser.add_argument("--md-steps", type=int, default=500)
     parser.add_argument("--md-sample-interval", type=int, default=10)
+    parser.add_argument(
+        "--md-frame-select-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of sampled MD snapshots retained after run (random selection).",
+    )
+    parser.add_argument(
+        "--md-min-step-multiplier",
+        type=float,
+        default=4.0,
+        help="Minimum multiplier on required sampled snapshots for MD run length.",
+    )
     parser.add_argument("--md-friction-per-fs", type=float, default=0.001)
     parser.add_argument("--uma-model-name", type=str, default="uma-s-1p1")
     parser.add_argument("--uma-task-id", type=str, default="omat")
@@ -168,6 +180,8 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.md_timestep_fs = args.md_timestep_fs
     config.sampling.md_steps = args.md_steps
     config.sampling.md_sample_interval = args.md_sample_interval
+    config.sampling.md_frame_select_fraction = args.md_frame_select_fraction
+    config.sampling.md_min_step_multiplier = args.md_min_step_multiplier
     config.sampling.md_friction_per_fs = args.md_friction_per_fs
     config.sampling.uma_model_name = args.uma_model_name
     config.sampling.uma_task_id = args.uma_task_id
@@ -296,6 +310,12 @@ class ElectrodeStructureGenerationPipeline:
         if self.config.sampling.md_sample_interval <= 0:
             raise ValueError("--md-sample-interval must be > 0")
 
+        if not (0.0 < self.config.sampling.md_frame_select_fraction <= 1.0):
+            raise ValueError("--md-frame-select-fraction must be in (0, 1]")
+
+        if self.config.sampling.md_min_step_multiplier < 1.0:
+            raise ValueError("--md-min-step-multiplier must be >= 1")
+
         if self.config.sampling.direct_threshold_init <= 0:
             raise ValueError("--direct-threshold-init must be > 0")
 
@@ -369,6 +389,8 @@ class ElectrodeStructureGenerationPipeline:
                 "md_timestep_fs": self.config.sampling.md_timestep_fs,
                 "md_steps": self.config.sampling.md_steps,
                 "md_sample_interval": self.config.sampling.md_sample_interval,
+                "md_frame_select_fraction": self.config.sampling.md_frame_select_fraction,
+                "md_min_step_multiplier": self.config.sampling.md_min_step_multiplier,
                 "md_friction_per_fs": self.config.sampling.md_friction_per_fs,
                 "uma_model_name": self.config.sampling.uma_model_name,
                 "uma_task_id": self.config.sampling.uma_task_id,
@@ -941,8 +963,8 @@ class ElectrodeStructureGenerationPipeline:
                         completed_delta=len(snapshots),
                         base_index=base_idx + 1,
                         base_total=max_bases,
-                        md_steps_done=self.config.sampling.md_steps,
-                        md_steps_total=self.config.sampling.md_steps,
+                        md_steps_done=self._required_md_steps(n_structures),
+                        md_steps_total=self._required_md_steps(n_structures),
                         snapshots_captured=len(snapshots),
                     )
 
@@ -1037,7 +1059,7 @@ class ElectrodeStructureGenerationPipeline:
             snapshots.append(atoms.copy())
 
         dyn.attach(_capture, interval=self.config.sampling.md_sample_interval)
-        n_steps = max(self.config.sampling.md_steps, n_structures * self.config.sampling.md_sample_interval)
+        n_steps = self._required_md_steps(n_structures)
 
         if progress_callback is not None:
             sample_interval = self.config.sampling.md_sample_interval
@@ -1055,7 +1077,7 @@ class ElectrodeStructureGenerationPipeline:
             dyn.attach(_progress_hook, interval=sample_interval)
 
         dyn.run(steps=n_steps)
-        return self._select_even_snapshots(snapshots, n_structures)
+        return self._select_even_snapshots(snapshots, n_structures, seed=seed)
 
     def _run_matgl_md_snapshots(self, atoms, temperature: int, n_structures: int, seed: int, progress_callback=None):
         import matgl
@@ -1077,14 +1099,13 @@ class ElectrodeStructureGenerationPipeline:
 
         potential = self._load_matgl_potential(matgl)
 
-        del seed
         tmp_dir = self.config.output.output_dir / "_tmp_md"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         token = random.randint(10_000, 99_999)
         traj_path = tmp_dir / f"matgl_T{temperature}_{token}.traj"
         log_path = tmp_dir / f"matgl_T{temperature}_{token}.log"
 
-        n_steps = max(self.config.sampling.md_steps, n_structures * self.config.sampling.md_sample_interval)
+        n_steps = self._required_md_steps(n_structures)
         md = MolecularDynamics(
             atoms=atoms.copy(),
             potential=potential,
@@ -1116,7 +1137,7 @@ class ElectrodeStructureGenerationPipeline:
         with Trajectory(str(traj_path)) as traj:
             snapshots = [frame.copy() for frame in traj]
 
-        return self._select_even_snapshots(snapshots, n_structures)
+        return self._select_even_snapshots(snapshots, n_structures, seed=seed)
 
     def _ensure_matgl_backend(self, matgl_module) -> None:
         backend_setting = self.config.sampling.matgl_backend.lower()
@@ -1148,11 +1169,25 @@ class ElectrodeStructureGenerationPipeline:
                 ) from exc
             raise
 
-    def _select_even_snapshots(self, snapshots, n_keep: int):
+    def _required_md_steps(self, n_structures: int) -> int:
+        sample_interval = int(self.config.sampling.md_sample_interval)
+        base_samples = max(1, int(math.ceil(n_structures)))
+        fraction = float(self.config.sampling.md_frame_select_fraction)
+        min_multiplier = max(4.0, float(self.config.sampling.md_min_step_multiplier))
+        required_samples = max(
+            int(math.ceil(base_samples / max(fraction, 1e-9))),
+            int(math.ceil(base_samples * min_multiplier)),
+        )
+        required_by_sampling = required_samples * sample_interval
+        return max(int(self.config.sampling.md_steps), required_by_sampling)
+
+    def _select_even_snapshots(self, snapshots, n_keep: int, seed: int):
         if len(snapshots) <= n_keep:
             return snapshots
-        indices = np.linspace(0, len(snapshots) - 1, n_keep, dtype=int)
-        return [snapshots[i] for i in indices]
+        rng = random.Random(seed)
+        indices = list(range(len(snapshots)))
+        selected = sorted(rng.sample(indices, n_keep))
+        return [snapshots[i] for i in selected]
 
     def _split_counts(self, keys: list[str], total: int) -> dict[str, int]:
         base = total // len(keys)
@@ -1369,6 +1404,8 @@ class ElectrodeStructureGenerationPipeline:
                         f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
                         f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                         f"--rattle-engine {engine} --md-execution run --skip-direct "
+                        f"--md-frame-select-fraction {self.config.sampling.md_frame_select_fraction} "
+                        f"--md-min-step-multiplier {self.config.sampling.md_min_step_multiplier} "
                         f"{_md_backend_args(engine)} "
                         f"--only-temperature {temperature} --only-lithiation-fraction {lith:.8f} "
                         f"--target-rattle-count {per_bin} --temperatures {' '.join(str(t) for t in temperatures)}"
@@ -1386,6 +1423,8 @@ class ElectrodeStructureGenerationPipeline:
                     f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
                     f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                     f"--rattle-engine {engine} --md-execution run --skip-direct "
+                    f"--md-frame-select-fraction {self.config.sampling.md_frame_select_fraction} "
+                    f"--md-min-step-multiplier {self.config.sampling.md_min_step_multiplier} "
                     f"{_md_backend_args(engine)} "
                     f"--temperatures {' '.join(str(t) for t in temperatures)}"
                 )
