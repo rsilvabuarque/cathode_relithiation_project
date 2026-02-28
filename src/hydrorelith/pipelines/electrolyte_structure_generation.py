@@ -224,7 +224,7 @@ class ElectrolyteStructureGenerationPipeline:
 
     @staticmethod
     def _bounded_seed(seed: int) -> int:
-        return int(seed % (2**32 - 1))
+        return int(int(seed) % (2**32))
 
     def _resolve_solvent_density(self) -> float:
         if self.args.solvent_density_g_cm3 is not None:
