@@ -222,6 +222,10 @@ class ElectrolyteStructureGenerationPipeline:
         self.solvent_density = self._resolve_solvent_density()
         self.templates = self._load_templates()
 
+    @staticmethod
+    def _bounded_seed(seed: int) -> int:
+        return int(seed % (2**32 - 1))
+
     def _resolve_solvent_density(self) -> float:
         if self.args.solvent_density_g_cm3 is not None:
             return float(self.args.solvent_density_g_cm3)
@@ -353,7 +357,9 @@ class ElectrolyteStructureGenerationPipeline:
             summary[label]["engine_context"] = engine or "none"
 
             for idx in range(n_per_concentration):
-                seed = 1_000_003 * (idx + 1) + int(round(100 * li_m)) * 101 + int(round(100 * k_m)) * 137
+                seed = self._bounded_seed(
+                    1_000_003 * (idx + 1) + int(round(100 * li_m)) * 101 + int(round(100 * k_m)) * 137
+                )
                 structure = self._build_amorphous_structure(plan, seed=seed)
                 generated.append(
                     ElectrolyteStructure(
@@ -602,7 +608,7 @@ class ElectrolyteStructureGenerationPipeline:
                 if n_structures <= 0:
                     continue
                 atoms = self.adaptor.get_atoms(base_item.structure)
-                seed = 11_000_003 * temperature + 113 * base_item.candidate_index + 17
+                seed = self._bounded_seed(11_000_003 * temperature + 113 * base_item.candidate_index + 17)
 
                 if self.args.rattle_method == "gaussian":
                     scaled_std = self.args.rattle_std_300k * math.sqrt(temperature / 300.0)
@@ -836,7 +842,7 @@ class ElectrolyteStructureGenerationPipeline:
                 if n_structures <= 0:
                     continue
                 atoms = self.adaptor.get_atoms(base_item.structure)
-                seed = 13_000_003 * temperature + 127 * base_item.candidate_index + 29
+                seed = self._bounded_seed(13_000_003 * temperature + 127 * base_item.candidate_index + 29)
                 fraction = float(self.args.md_frame_select_fraction)
                 live_progress = {"selected_equiv": 0}
 
