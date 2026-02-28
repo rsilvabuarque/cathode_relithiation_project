@@ -578,17 +578,9 @@ class ElectrolyteStructureGenerationPipeline:
         combined: list[ElectrolyteStructure] = []
 
         hiphive_rattled = self.generate_rattled_candidates(hiphive_structures, engine="hiphive")
-        self.write_structures(
-            hiphive_rattled,
-            base_dir=self.args.output_dir / "rattled_pool" / "engine_hiphive",
-        )
         combined.extend(hiphive_rattled)
 
         uma_rattled = self.generate_rattled_candidates(uma_structures, engine="uma")
-        self.write_structures(
-            uma_rattled,
-            base_dir=self.args.output_dir / "rattled_pool" / "engine_uma",
-        )
         combined.extend(uma_rattled)
         return combined
 
@@ -613,6 +605,7 @@ class ElectrolyteStructureGenerationPipeline:
 
         expanded: list[ElectrolyteStructure] = []
         for idx, (temperature, conc) in enumerate(bins):
+            bin_generated: list[ElectrolyteStructure] = []
             n_bin = per_bin + (1 if idx < rem else 0)
             base = grouped[conc]
             max_bases = min(self.args.max_base_structures_per_bin, len(base))
@@ -672,18 +665,18 @@ class ElectrolyteStructureGenerationPipeline:
                             )
 
                 for ridx, rattled_atoms in enumerate(rattled):
-                    expanded.append(
-                        ElectrolyteStructure(
-                            structure=self.adaptor.get_structure(rattled_atoms),
-                            concentration_label=base_item.concentration_label,
-                            li_molality=base_item.li_molality,
-                            k_molality=base_item.k_molality,
-                            density_g_cm3=base_item.density_g_cm3,
-                            temperature_k=temperature,
-                            candidate_index=base_item.candidate_index * 10_000 + ridx,
-                            source_engine="hiphive",
-                        )
+                    generated_item = ElectrolyteStructure(
+                        structure=self.adaptor.get_structure(rattled_atoms),
+                        concentration_label=base_item.concentration_label,
+                        li_molality=base_item.li_molality,
+                        k_molality=base_item.k_molality,
+                        density_g_cm3=base_item.density_g_cm3,
+                        temperature_k=temperature,
+                        candidate_index=base_item.candidate_index * 10_000 + ridx,
+                        source_engine="hiphive",
                     )
+                    expanded.append(generated_item)
+                    bin_generated.append(generated_item)
 
                 produced_bin += len(rattled)
                 if pbar is not None:
@@ -695,6 +688,11 @@ class ElectrolyteStructureGenerationPipeline:
                 pbar.close()
             else:
                 print(f"[progress] hiPhive completed T={temperature}K {conc}: {produced_bin}/{n_bin}")
+            if bin_generated:
+                self.write_structures(
+                    bin_generated,
+                    base_dir=self.args.output_dir / "rattled_pool" / "engine_hiphive",
+                )
 
         return expanded
 
@@ -859,6 +857,7 @@ class ElectrolyteStructureGenerationPipeline:
 
         expanded: list[ElectrolyteStructure] = []
         for idx, (temperature, conc) in enumerate(bins):
+            bin_generated: list[ElectrolyteStructure] = []
             n_bin = per_bin + (1 if idx < rem else 0)
             base = grouped[conc]
             max_bases = min(self.args.max_base_structures_per_bin, len(base))
@@ -906,21 +905,26 @@ class ElectrolyteStructureGenerationPipeline:
                 if pbar is not None and live_progress["selected_equiv"] < len(snaps):
                     pbar.update(len(snaps) - live_progress["selected_equiv"])
                 for sidx, snap in enumerate(snaps):
-                    expanded.append(
-                        ElectrolyteStructure(
-                            structure=self.adaptor.get_structure(snap),
-                            concentration_label=conc,
-                            li_molality=base_item.li_molality,
-                            k_molality=base_item.k_molality,
-                            density_g_cm3=base_item.density_g_cm3,
-                            temperature_k=temperature,
-                            candidate_index=base_item.candidate_index * 100_000 + sidx,
-                            source_engine="uma",
-                        )
+                    generated_item = ElectrolyteStructure(
+                        structure=self.adaptor.get_structure(snap),
+                        concentration_label=conc,
+                        li_molality=base_item.li_molality,
+                        k_molality=base_item.k_molality,
+                        density_g_cm3=base_item.density_g_cm3,
+                        temperature_k=temperature,
+                        candidate_index=base_item.candidate_index * 100_000 + sidx,
+                        source_engine="uma",
                     )
+                    expanded.append(generated_item)
+                    bin_generated.append(generated_item)
 
             if pbar is not None:
                 pbar.close()
+            if bin_generated:
+                self.write_structures(
+                    bin_generated,
+                    base_dir=self.args.output_dir / "rattled_pool" / "engine_uma",
+                )
 
         return expanded
 
