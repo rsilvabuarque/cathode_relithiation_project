@@ -576,8 +576,20 @@ class ElectrolyteStructureGenerationPipeline:
         uma_structures: list[ElectrolyteStructure],
     ) -> list[ElectrolyteStructure]:
         combined: list[ElectrolyteStructure] = []
-        combined.extend(self.generate_rattled_candidates(hiphive_structures, engine="hiphive"))
-        combined.extend(self.generate_rattled_candidates(uma_structures, engine="uma"))
+
+        hiphive_rattled = self.generate_rattled_candidates(hiphive_structures, engine="hiphive")
+        self.write_structures(
+            hiphive_rattled,
+            base_dir=self.args.output_dir / "rattled_pool" / "engine_hiphive",
+        )
+        combined.extend(hiphive_rattled)
+
+        uma_rattled = self.generate_rattled_candidates(uma_structures, engine="uma")
+        self.write_structures(
+            uma_rattled,
+            base_dir=self.args.output_dir / "rattled_pool" / "engine_uma",
+        )
+        combined.extend(uma_rattled)
         return combined
 
     def _generate_rattled_hiphive(self, structures: list[ElectrolyteStructure], target_count: int) -> list[ElectrolyteStructure]:
@@ -585,6 +597,11 @@ class ElectrolyteStructureGenerationPipeline:
             from hiphive.structure_generation import generate_mc_rattled_structures, generate_rattled_structures
         except Exception as exc:
             raise RuntimeError("hiPhive is required for rattle-engine=hiphive") from exc
+
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
 
         grouped: dict[str, list[ElectrolyteStructure]] = defaultdict(list)
         for item in structures:
@@ -602,6 +619,13 @@ class ElectrolyteStructureGenerationPipeline:
             base_work = [n_bin // max_bases] * max_bases
             for i in range(n_bin % max_bases):
                 base_work[i] += 1
+
+            pbar = (
+                tqdm(total=n_bin, desc=f"hiPhive T={temperature}K {conc}", leave=False)
+                if tqdm is not None
+                else None
+            )
+            produced_bin = 0
 
             for base_idx, base_item in enumerate(base[:max_bases]):
                 n_structures = base_work[base_idx]
@@ -660,6 +684,17 @@ class ElectrolyteStructureGenerationPipeline:
                             source_engine="hiphive",
                         )
                     )
+
+                produced_bin += len(rattled)
+                if pbar is not None:
+                    pbar.update(len(rattled))
+                    runs_left = max_bases - (base_idx + 1)
+                    pbar.set_postfix_str(f"runs_left={runs_left}")
+
+            if pbar is not None:
+                pbar.close()
+            else:
+                print(f"[progress] hiPhive completed T={temperature}K {conc}: {produced_bin}/{n_bin}")
 
         return expanded
 
