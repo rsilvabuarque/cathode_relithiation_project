@@ -665,30 +665,25 @@ class ElectrolyteStructureGenerationPipeline:
 
     def _required_md_steps(self, n_structures: int) -> int:
         sample_interval = max(1, int(self.args.md_sample_interval))
-        minimum_steps = int(math.ceil(sample_interval * n_structures * float(self.args.md_min_step_multiplier)))
-        return max(minimum_steps, int(self.args.md_steps))
+        base_samples = max(1, int(math.ceil(n_structures)))
+        fraction = float(self.args.md_frame_select_fraction)
+        min_multiplier = max(1.0, float(self.args.md_min_step_multiplier))
+        required_samples = max(
+            int(math.ceil(base_samples / max(fraction, 1e-9))),
+            int(math.ceil(base_samples * min_multiplier)),
+        )
+        required_by_sampling = required_samples * sample_interval
+        return max(required_by_sampling, int(self.args.md_steps))
 
     def _select_even_snapshots(self, snapshots, n_keep: int, seed: int):
         if n_keep <= 0 or not snapshots:
             return []
         if len(snapshots) <= n_keep:
             return [snapshots[i].copy() for i in range(len(snapshots))]
-
-        n_select = max(1, int(round(len(snapshots) * float(self.args.md_frame_select_fraction))))
-        n_select = max(n_keep, n_select)
-        n_select = min(len(snapshots), n_select)
-
-        indices = np.arange(len(snapshots), dtype=int)
-        rng = np.random.default_rng(seed)
-        selected = np.sort(rng.choice(indices, size=n_select, replace=False))
-
-        if n_select == n_keep:
-            final_indices = selected
-        else:
-            spaced = np.linspace(0, n_select - 1, n_keep, dtype=int)
-            final_indices = selected[spaced]
-
-        return [snapshots[int(i)].copy() for i in final_indices]
+        rng = random.Random(seed)
+        indices = list(range(len(snapshots)))
+        selected = sorted(rng.sample(indices, n_keep))
+        return [snapshots[i].copy() for i in selected]
 
     def _md_output_paths(self, temperature: int, concentration_label: str, base_idx: int) -> tuple[Path, Path]:
         safe_label = concentration_label.replace("/", "_")
@@ -706,6 +701,7 @@ class ElectrolyteStructureGenerationPipeline:
         n_structures: int,
         seed: int,
         pressure_mpa: float | None = None,
+        progress_callback=None,
     ):
         from ase import units
         from ase.io import write
@@ -786,6 +782,19 @@ class ElectrolyteStructureGenerationPipeline:
         dyn.attach(_log_properties, interval=sample_interval)
         n_steps = self._required_md_steps(n_structures)
 
+        if progress_callback is not None:
+            def _progress_hook():
+                captured = len(snapshots)
+                done_steps = min(n_steps, captured * sample_interval)
+                progress_callback(
+                    stage="running",
+                    captured=captured,
+                    md_steps_done=done_steps,
+                    md_steps_total=n_steps,
+                )
+
+            dyn.attach(_progress_hook, interval=sample_interval)
+
         try:
             dyn.run(steps=n_steps)
         finally:
@@ -802,6 +811,11 @@ class ElectrolyteStructureGenerationPipeline:
         per_bin = target_count // len(bins)
         rem = target_count % len(bins)
 
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
+
         expanded: list[ElectrolyteStructure] = []
         for idx, (temperature, conc) in enumerate(bins):
             n_bin = per_bin + (1 if idx < rem else 0)
@@ -811,12 +825,33 @@ class ElectrolyteStructureGenerationPipeline:
             for i in range(n_bin % max_bases):
                 base_work[i] += 1
 
+            pbar = (
+                tqdm(total=n_bin, desc=f"UMA MD T={temperature}K {conc}", leave=False)
+                if tqdm is not None
+                else None
+            )
+
             for base_idx, base_item in enumerate(base[:max_bases]):
                 n_structures = base_work[base_idx]
                 if n_structures <= 0:
                     continue
                 atoms = self.adaptor.get_atoms(base_item.structure)
                 seed = 13_000_003 * temperature + 127 * base_item.candidate_index + 29
+                fraction = float(self.args.md_frame_select_fraction)
+                live_progress = {"selected_equiv": 0}
+
+                def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
+                    if pbar is None or stage != "running":
+                        return
+                    estimated_selected = min(
+                        n_structures,
+                        int(math.floor(captured * fraction + 1e-12)),
+                    )
+                    delta = estimated_selected - live_progress["selected_equiv"]
+                    if delta > 0:
+                        pbar.update(delta)
+                        live_progress["selected_equiv"] = estimated_selected
+
                 snaps = self._run_uma_md_snapshots(
                     atoms=atoms,
                     temperature=temperature,
@@ -825,7 +860,10 @@ class ElectrolyteStructureGenerationPipeline:
                     n_structures=n_structures,
                     seed=seed,
                     pressure_mpa=self._pressure_mpa_for_temperature(temperature),
+                    progress_callback=_progress_callback,
                 )
+                if pbar is not None and live_progress["selected_equiv"] < len(snaps):
+                    pbar.update(len(snaps) - live_progress["selected_equiv"])
                 for sidx, snap in enumerate(snaps):
                     expanded.append(
                         ElectrolyteStructure(
@@ -839,6 +877,9 @@ class ElectrolyteStructureGenerationPipeline:
                             source_engine="uma",
                         )
                     )
+
+            if pbar is not None:
+                pbar.close()
 
         return expanded
 

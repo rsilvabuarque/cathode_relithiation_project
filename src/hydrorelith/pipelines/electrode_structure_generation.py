@@ -771,8 +771,6 @@ class ElectrodeStructureGenerationPipeline:
                     n_structures = base_work[base_idx]
                     if n_structures <= 0:
                         completed_bases += 1
-                        if pbar is not None:
-                            pbar.update(1)
                         continue
 
                     start_base = time.time()
@@ -901,7 +899,7 @@ class ElectrodeStructureGenerationPipeline:
                     base_work[idx] += 1
 
                 progress_desc = f"{backend.upper()} MD T={temperature}K lith={lithiation*100:.2f}%"
-                pbar = tqdm(total=max_bases, desc=progress_desc, leave=False) if tqdm else None
+                pbar = tqdm(total=n_bin, desc=progress_desc, leave=False) if tqdm else None
                 per_base_durations: list[float] = []
                 completed_bases = 0
 
@@ -944,18 +942,21 @@ class ElectrodeStructureGenerationPipeline:
                             md_steps_total=0,
                             snapshots_captured=len(cached_structures),
                         )
+                        if pbar is not None:
+                            pbar.update(len(cached_structures))
                         completed_bases += 1
                         runs_left = max_bases - completed_bases
                         avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
                         eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                         if pbar is not None:
-                            pbar.update(1)
                             pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
                         continue
 
                     atoms = adaptor.get_atoms(base_item.structure)
                     seed = 7_000_001 * temperature + 151 * base_item.candidate_index + 19
                     start_base = time.time()
+                    fraction = float(self.config.sampling.md_frame_select_fraction)
+                    live_progress = {"selected_equiv": 0}
 
                     def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
                         self._update_md_runtime_stats(
@@ -970,6 +971,15 @@ class ElectrodeStructureGenerationPipeline:
                             md_steps_total=md_steps_total,
                             snapshots_captured=captured,
                         )
+                        if pbar is not None and stage == "running":
+                            estimated_selected = min(
+                                n_structures,
+                                int(math.floor(captured * fraction + 1e-12)),
+                            )
+                            delta = estimated_selected - live_progress["selected_equiv"]
+                            if delta > 0:
+                                pbar.update(delta)
+                                live_progress["selected_equiv"] = estimated_selected
 
                     self._update_md_runtime_stats(
                         backend=backend,
@@ -1035,6 +1045,8 @@ class ElectrodeStructureGenerationPipeline:
 
                     selected_structures = [adaptor.get_structure(snap_atoms) for snap_atoms in snapshots]
                     self._write_cached_structures(selected_structures, cache_paths)
+                    if pbar is not None and live_progress["selected_equiv"] < len(snapshots):
+                        pbar.update(len(snapshots) - live_progress["selected_equiv"])
 
                     completed_bases += 1
                     elapsed = max(time.time() - start_base, 1e-9)
@@ -1045,7 +1057,6 @@ class ElectrodeStructureGenerationPipeline:
                     avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
                     eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                     if pbar is not None:
-                        pbar.update(1)
                         pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
 
                     self._update_md_runtime_stats(
@@ -1390,7 +1401,7 @@ class ElectrodeStructureGenerationPipeline:
         sample_interval = int(self.config.sampling.md_sample_interval)
         base_samples = max(1, int(math.ceil(n_structures)))
         fraction = float(self.config.sampling.md_frame_select_fraction)
-        min_multiplier = max(4.0, float(self.config.sampling.md_min_step_multiplier))
+        min_multiplier = max(1.0, float(self.config.sampling.md_min_step_multiplier))
         required_samples = max(
             int(math.ceil(base_samples / max(fraction, 1e-9))),
             int(math.ceil(base_samples * min_multiplier)),
