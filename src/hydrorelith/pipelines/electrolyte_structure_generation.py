@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-structures", type=int, default=600)
     parser.add_argument("--oversampling-factor", type=int, default=10)
-    parser.add_argument("--rattle-engine", choices=["hiphive", "uma"], default="hiphive")
+    parser.add_argument("--rattle-engine", choices=["hiphive", "uma", "all"], default="hiphive")
     parser.add_argument("--rattle-method", choices=["mc", "gaussian"], default="mc")
     parser.add_argument("--md-ensemble", choices=["nvt", "npt"], default="npt")
     parser.add_argument("--md-steps", type=int, default=500)
@@ -127,6 +127,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rattle-d-min", type=float, default=1.5)
     parser.add_argument("--rattle-n-iter", type=int, default=10)
     parser.add_argument("--max-base-structures-per-bin", type=int, default=25)
+    parser.add_argument(
+        "--hiphive-base-structures-per-concentration",
+        type=int,
+        default=None,
+        help="Optional override for number of base amorphous structures per concentration for hiPhive path.",
+    )
+    parser.add_argument(
+        "--uma-base-structures-per-concentration",
+        type=int,
+        default=None,
+        help="Optional override for number of base amorphous structures per concentration for UMA MD path.",
+    )
+    parser.add_argument(
+        "--hiphive-rattle-fraction-in-all",
+        type=float,
+        default=0.40,
+        help="In all-mode, fraction of target pre-DIRECT pool assigned to hiPhive (UMA gets the remainder).",
+    )
     parser.add_argument(
         "--temperatures",
         type=int,
@@ -144,7 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--direct-threshold-init", type=float, default=0.05)
     parser.add_argument("--skip-rattling", action="store_true")
     parser.add_argument("--skip-direct", action="store_true")
-    parser.add_argument("--allow-overlap", action="store_true")
+    parser.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow atom overlaps during amorphous building (disabled by default).",
+    )
     return parser
 
 
@@ -258,13 +280,32 @@ class ElectrolyteStructureGenerationPipeline:
 
     def run(self) -> None:
         self.args.output_dir.mkdir(parents=True, exist_ok=True)
-        base_structures = self.generate_base_structures()
-        self.write_structures(base_structures, base_dir=self.args.output_dir / "base_structures")
+
+        if self.args.rattle_engine == "all" and not self.args.skip_rattling:
+            base_structures_hiphive = self.generate_base_structures(engine="hiphive")
+            base_structures_uma = self.generate_base_structures(engine="uma")
+            self.write_structures(
+                base_structures_hiphive,
+                base_dir=self.args.output_dir / "base_structures" / "engine_hiphive",
+            )
+            self.write_structures(
+                base_structures_uma,
+                base_dir=self.args.output_dir / "base_structures" / "engine_uma",
+            )
+        else:
+            base_structures = self.generate_base_structures(engine=self.args.rattle_engine)
+            self.write_structures(base_structures, base_dir=self.args.output_dir / "base_structures")
 
         if self.args.skip_rattling:
             selected = base_structures
         else:
-            rattled = self.generate_rattled_candidates(base_structures)
+            if self.args.rattle_engine == "all":
+                rattled = self.generate_rattled_candidates_all(
+                    hiphive_structures=base_structures_hiphive,
+                    uma_structures=base_structures_uma,
+                )
+            else:
+                rattled = self.generate_rattled_candidates(base_structures, engine=self.args.rattle_engine)
             if self.args.skip_direct:
                 selected = rattled
             else:
@@ -272,9 +313,23 @@ class ElectrolyteStructureGenerationPipeline:
 
         self.write_structures(selected, base_dir=self.args.output_dir / "best_training_set")
 
-    def generate_base_structures(self) -> list[ElectrolyteStructure]:
+    def _base_structures_per_concentration(self, engine: str | None) -> int:
+        if engine == "hiphive" and self.args.hiphive_base_structures_per_concentration is not None:
+            return max(1, int(self.args.hiphive_base_structures_per_concentration))
+        if engine == "uma" and self.args.uma_base_structures_per_concentration is not None:
+            return max(1, int(self.args.uma_base_structures_per_concentration))
+
+        base = max(1, int(self.args.structures_per_concentration))
+        if engine == "uma":
+            return max(1, int(math.ceil(base / 3.0)))
+        if engine == "hiphive":
+            return max(3, base)
+        return base
+
+    def generate_base_structures(self, engine: str | None = None) -> list[ElectrolyteStructure]:
         generated: list[ElectrolyteStructure] = []
         summary: dict[str, dict] = {}
+        n_per_concentration = self._base_structures_per_concentration(engine)
 
         for li_m, k_m in self.concentration_pairs:
             label = self._concentration_label(li_m, k_m)
@@ -294,7 +349,10 @@ class ElectrolyteStructureGenerationPipeline:
                 "box_length_a": plan.box_length_a,
             }
 
-            for idx in range(self.args.structures_per_concentration):
+            summary[label]["n_base_structures"] = int(n_per_concentration)
+            summary[label]["engine_context"] = engine or "none"
+
+            for idx in range(n_per_concentration):
                 seed = 1_000_003 * (idx + 1) + int(round(100 * li_m)) * 101 + int(round(100 * k_m)) * 137
                 structure = self._build_amorphous_structure(plan, seed=seed)
                 generated.append(
@@ -308,7 +366,8 @@ class ElectrolyteStructureGenerationPipeline:
                     )
                 )
 
-        summary_path = self.args.output_dir / "electrolyte_generation_overview.json"
+        suffix = f"_{engine}" if engine else ""
+        summary_path = self.args.output_dir / f"electrolyte_generation_overview{suffix}.json"
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return generated
 
@@ -424,14 +483,12 @@ class ElectrolyteStructureGenerationPipeline:
             template = self.templates[key]
             centered = template.coords - np.mean(template.coords, axis=0)
             for _ in range(count):
-                rot = self._random_rotation_matrix(rng)
-                rotated = centered @ rot.T
-                shift = rng.uniform(0.0, box_len, size=3)
-                placed = (rotated + shift) % box_len
-
-                if not self.args.allow_overlap and cart_coords:
-                    if self._has_overlap(existing=cart_coords, candidate=placed, box_len=box_len):
-                        continue
+                placed = self._place_molecule(
+                    centered_coords=centered,
+                    existing=cart_coords,
+                    box_len=box_len,
+                    rng=rng,
+                )
 
                 for atom_symbol, atom_xyz in zip(template.species, placed):
                     species.append(atom_symbol)
@@ -450,6 +507,29 @@ class ElectrolyteStructureGenerationPipeline:
                 return True
         return False
 
+    def _place_molecule(
+        self,
+        centered_coords: np.ndarray,
+        existing: list[np.ndarray],
+        box_len: float,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        if self.args.allow_overlap or not existing:
+            rot = self._random_rotation_matrix(rng)
+            return (centered_coords @ rot.T + rng.uniform(0.0, box_len, size=3)) % box_len
+
+        max_attempts = 1000
+        for _ in range(max_attempts):
+            rot = self._random_rotation_matrix(rng)
+            placed = (centered_coords @ rot.T + rng.uniform(0.0, box_len, size=3)) % box_len
+            if not self._has_overlap(existing=existing, candidate=placed, box_len=box_len):
+                return placed
+
+        raise RuntimeError(
+            "Unable to place molecule without overlap after many attempts. "
+            "Increase max-atoms/box size or use --allow-overlap if absolutely necessary."
+        )
+
     def _random_rotation_matrix(self, rng: np.random.Generator) -> np.ndarray:
         u1, u2, u3 = rng.random(3)
         q1 = math.sqrt(1 - u1) * math.sin(2 * math.pi * u2)
@@ -465,11 +545,34 @@ class ElectrolyteStructureGenerationPipeline:
             ]
         )
 
-    def generate_rattled_candidates(self, structures: list[ElectrolyteStructure]) -> list[ElectrolyteStructure]:
-        target_count = self.args.max_structures * self.args.oversampling_factor
-        if self.args.rattle_engine == "hiphive":
+    def _target_count_for_engine(self, engine: str) -> int:
+        base_target = int(self.args.max_structures * self.args.oversampling_factor)
+        if self.args.rattle_engine != "all":
+            return base_target
+
+        hip_frac = float(self.args.hiphive_rattle_fraction_in_all)
+        hip_frac = max(0.05, min(0.95, hip_frac))
+        hip_target = max(1, int(round(base_target * hip_frac)))
+        uma_target = max(1, base_target - hip_target)
+        return hip_target if engine == "hiphive" else uma_target
+
+    def generate_rattled_candidates(self, structures: list[ElectrolyteStructure], engine: str) -> list[ElectrolyteStructure]:
+        target_count = self._target_count_for_engine(engine)
+        if engine == "hiphive":
             return self._generate_rattled_hiphive(structures, target_count)
-        return self._generate_rattled_uma(structures, target_count)
+        if engine == "uma":
+            return self._generate_rattled_uma(structures, target_count)
+        raise ValueError(f"Unsupported rattling engine: {engine}")
+
+    def generate_rattled_candidates_all(
+        self,
+        hiphive_structures: list[ElectrolyteStructure],
+        uma_structures: list[ElectrolyteStructure],
+    ) -> list[ElectrolyteStructure]:
+        combined: list[ElectrolyteStructure] = []
+        combined.extend(self.generate_rattled_candidates(hiphive_structures, engine="hiphive"))
+        combined.extend(self.generate_rattled_candidates(uma_structures, engine="uma"))
+        return combined
 
     def _generate_rattled_hiphive(self, structures: list[ElectrolyteStructure], target_count: int) -> list[ElectrolyteStructure]:
         try:
@@ -511,14 +614,32 @@ class ElectrolyteStructureGenerationPipeline:
                     )
                 else:
                     scaled_std = self.args.rattle_std_300k * math.sqrt(temperature / 300.0)
-                    rattled = generate_mc_rattled_structures(
-                        atoms=atoms,
-                        n_structures=n_structures,
-                        rattle_std=scaled_std,
-                        d_min=self.args.rattle_d_min,
-                        n_iter=self.args.rattle_n_iter,
-                        seed=seed,
-                    )
+                    try:
+                        rattled = generate_mc_rattled_structures(
+                            atoms=atoms,
+                            n_structures=n_structures,
+                            rattle_std=scaled_std,
+                            d_min=self.args.rattle_d_min,
+                            n_iter=self.args.rattle_n_iter,
+                            seed=seed,
+                        )
+                    except Exception:
+                        try:
+                            rattled = generate_mc_rattled_structures(
+                                atoms=atoms,
+                                n_structures=n_structures,
+                                rattle_std=scaled_std,
+                                d_min=max(0.8, float(self.args.rattle_d_min) * 0.7),
+                                n_iter=max(20, int(self.args.rattle_n_iter) * 2),
+                                seed=seed,
+                            )
+                        except Exception:
+                            rattled = generate_rattled_structures(
+                                atoms=atoms,
+                                n_structures=n_structures,
+                                rattle_std=scaled_std,
+                                seed=seed,
+                            )
 
                 for ridx, rattled_atoms in enumerate(rattled):
                     expanded.append(
