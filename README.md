@@ -139,6 +139,19 @@ DIRECT plotting outputs are written to:
 └── coverage_scores.png
 ```
 
+All-mode option-comparison analysis outputs (electrode and electrolyte) include:
+
+```text
+<output_dir>/direct_metrics/
+├── source_contribution_by_option.png
+├── selected_temperature_pressure_distribution.png
+├── selected_lithiation_distribution.png                 # electrode
+├── selected_li_concentration_distribution.png           # electrolyte
+└── training_set_comparison.json
+```
+
+`training_set_comparison.json` now includes per-option source counts (`hiphive`, `uma`, `matgl/other`) for both pre-DIRECT pools and DIRECT-selected sets, plus DIRECT-selected distributions by temperature/pressure and composition key (lithiation for electrode, LiOH concentration for electrolyte).
+
 In `all` mode, per-option metrics are written under:
 
 ```text

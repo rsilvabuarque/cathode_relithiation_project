@@ -2036,6 +2036,102 @@ class ElectrodeStructureGenerationPipeline:
         ]
         return float(np.mean(scores_direct))
 
+    def _source_counts(self, structures: list[GeneratedStructure]) -> dict[str, int]:
+        counts = {"hiphive": 0, "uma": 0, "matgl": 0, "other": 0}
+        for item in structures:
+            engine = str(item.source_engine or "other").lower()
+            if engine in {"hiphive", "uma", "matgl"}:
+                counts[engine] += 1
+            else:
+                counts["other"] += 1
+        return counts
+
+    def _condition_counts(self, structures: list[GeneratedStructure]) -> tuple[dict[str, int], dict[str, int]]:
+        tp_counts: dict[str, int] = defaultdict(int)
+        lith_counts: dict[str, int] = defaultdict(int)
+        for item in structures:
+            if item.temperature_k is None:
+                continue
+            temperature = int(item.temperature_k)
+            pressure_mpa = self._pressure_mpa_for_temperature(temperature)
+            tp_key = f"T{temperature}K_P{pressure_mpa:.2f}MPa"
+            tp_counts[tp_key] += 1
+            lith_key = f"lith_{100.0 * float(item.lithiation_fraction):.2f}%"
+            lith_counts[lith_key] += 1
+        return dict(tp_counts), dict(lith_counts)
+
+    def _plot_source_contribution_by_option(
+        self,
+        option_pool_counts: dict[str, dict[str, int]],
+        option_selected_counts: dict[str, dict[str, int]],
+        metrics_dir: Path,
+    ) -> None:
+        option_order = ["hiphive", "uma", "combined", "matgl"]
+        labels = [name for name in option_order if name in option_pool_counts]
+        if not labels:
+            return
+
+        engines = ["hiphive", "uma", "matgl"]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+        for ax, source_map, title in [
+            (axes[0], option_pool_counts, "Pre-DIRECT pool"),
+            (axes[1], option_selected_counts, "DIRECT selected"),
+        ]:
+            x = np.arange(len(labels))
+            width = 0.22
+            for idx, engine in enumerate(engines):
+                values = [source_map[label].get(engine, 0) for label in labels]
+                ax.bar(x + (idx - 1.0) * width, values, width=width, label=engine.upper())
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.set_title(title)
+            ax.set_ylabel("Structure count")
+            ax.legend(frameon=False)
+
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "source_contribution_by_option.png", dpi=200)
+        plt.close()
+
+    def _plot_condition_distribution_by_option(
+        self,
+        option_tp_counts: dict[str, dict[str, int]],
+        option_lith_counts: dict[str, dict[str, int]],
+        metrics_dir: Path,
+    ) -> None:
+        option_order = ["hiphive", "uma", "combined", "matgl"]
+        ordered_options = [opt for opt in option_order if opt in option_tp_counts]
+        if not ordered_options:
+            return
+
+        all_tp_keys = sorted({key for counts in option_tp_counts.values() for key in counts})
+        all_lith_keys = sorted({key for counts in option_lith_counts.values() for key in counts})
+
+        fig, axes = plt.subplots(len(ordered_options), 1, figsize=(12, 3.2 * len(ordered_options)), squeeze=False)
+        for row, option in enumerate(ordered_options):
+            values = [option_tp_counts[option].get(key, 0) for key in all_tp_keys]
+            ax = axes[row, 0]
+            ax.bar(range(len(all_tp_keys)), values)
+            ax.set_title(f"{option}: DIRECT-selected T/P distribution")
+            ax.set_ylabel("Count")
+            ax.set_xticks(range(len(all_tp_keys)))
+            ax.set_xticklabels(all_tp_keys, rotation=45, ha="right", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "selected_temperature_pressure_distribution.png", dpi=220)
+        plt.close()
+
+        fig, axes = plt.subplots(len(ordered_options), 1, figsize=(11, 3.0 * len(ordered_options)), squeeze=False)
+        for row, option in enumerate(ordered_options):
+            values = [option_lith_counts[option].get(key, 0) for key in all_lith_keys]
+            ax = axes[row, 0]
+            ax.bar(range(len(all_lith_keys)), values)
+            ax.set_title(f"{option}: DIRECT-selected lithiation distribution")
+            ax.set_ylabel("Count")
+            ax.set_xticks(range(len(all_lith_keys)))
+            ax.set_xticklabels(all_lith_keys, rotation=45, ha="right", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "selected_lithiation_distribution.png", dpi=220)
+        plt.close()
+
     def _select_best_training_set_from_all_mode(
         self,
         rattled_candidates: list[GeneratedStructure],
@@ -2057,6 +2153,10 @@ class ElectrodeStructureGenerationPipeline:
         options_dir = self.config.output.output_dir / "training_set_options"
         metrics_root = self.config.output.output_dir / "direct_metrics"
         metrics_root.mkdir(parents=True, exist_ok=True)
+        option_pool_source_counts: dict[str, dict[str, int]] = {}
+        option_selected_source_counts: dict[str, dict[str, int]] = {}
+        option_tp_counts: dict[str, dict[str, int]] = {}
+        option_lith_counts: dict[str, dict[str, int]] = {}
 
         for option_name, pool in option_pools.items():
             if not pool:
@@ -2070,10 +2170,21 @@ class ElectrodeStructureGenerationPipeline:
             selected = self.select_with_direct(pool)
             selected_by_option[option_name] = selected
             score = self._direct_mean_coverage_score(pool, selected)
+            pool_source = self._source_counts(pool)
+            selected_source = self._source_counts(selected)
+            tp_counts, lith_counts = self._condition_counts(selected)
+            option_pool_source_counts[option_name] = pool_source
+            option_selected_source_counts[option_name] = selected_source
+            option_tp_counts[option_name] = tp_counts
+            option_lith_counts[option_name] = lith_counts
             comparison["options"][option_name] = {
                 "pool_size": int(len(pool)),
                 "selected_size": int(len(selected)),
                 "direct_mean_coverage_score": float(score),
+                "source_counts_pool": pool_source,
+                "source_counts_selected": selected_source,
+                "selected_temperature_pressure_counts": tp_counts,
+                "selected_lithiation_counts": lith_counts,
             }
 
             option_dir = options_dir / option_name
@@ -2081,6 +2192,17 @@ class ElectrodeStructureGenerationPipeline:
 
             if self.config.sampling.direct_plot_metrics:
                 self.plot_direct_metrics(pool, selected, metrics_dir=metrics_root / f"option_{option_name}")
+
+        self._plot_source_contribution_by_option(
+            option_pool_counts=option_pool_source_counts,
+            option_selected_counts=option_selected_source_counts,
+            metrics_dir=metrics_root,
+        )
+        self._plot_condition_distribution_by_option(
+            option_tp_counts=option_tp_counts,
+            option_lith_counts=option_lith_counts,
+            metrics_dir=metrics_root,
+        )
 
         if not selected_by_option:
             raise RuntimeError("No candidate pools available for all-mode DIRECT comparison.")

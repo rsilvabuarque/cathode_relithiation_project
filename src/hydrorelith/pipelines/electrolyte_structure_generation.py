@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 from pymatgen.core import Lattice, Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
@@ -326,7 +328,11 @@ class ElectrolyteStructureGenerationPipeline:
             if self.args.skip_direct:
                 selected = rattled
             else:
-                selected = self.select_with_direct(rattled)
+                if self.args.rattle_engine == "all":
+                    selected = self._select_best_training_set_from_all_mode(rattled)
+                else:
+                    selected = self.select_with_direct(rattled)
+                    self.plot_direct_metrics(rattled, selected)
 
         self.write_structures(selected, base_dir=self.args.output_dir / "best_training_set")
 
@@ -1497,6 +1503,342 @@ class ElectrolyteStructureGenerationPipeline:
             fill = self._greedy_maximin_indices(vectors[remaining], min(n_select - len(selected), len(remaining)))
             selected.extend(remaining[i] for i in fill)
         return selected[:n_select]
+
+    def _direct_mean_coverage_score(
+        self,
+        all_structures: list[ElectrolyteStructure],
+        selected_structures: list[ElectrolyteStructure],
+    ) -> float:
+        if not all_structures or not selected_structures:
+            return 0.0
+
+        all_features = np.array([self._compute_descriptor(item) for item in all_structures], dtype=float)
+        selected_features = np.array([self._compute_descriptor(item) for item in selected_structures], dtype=float)
+
+        selected_indexes: list[int] = []
+        used = set()
+        for sf in selected_features:
+            candidates = np.where(np.all(np.isclose(all_features, sf, atol=1e-8), axis=1))[0]
+            for idx in candidates:
+                if idx not in used:
+                    selected_indexes.append(int(idx))
+                    used.add(int(idx))
+                    break
+
+        if not selected_indexes:
+            return 0.0
+
+        from sklearn.decomposition import PCA
+
+        n_components = min(30, all_features.shape[0], all_features.shape[1])
+        pca = PCA(n_components=n_components)
+        pca_features = pca.fit_transform(all_features)
+        weighted = pca_features[:, : min(7, pca_features.shape[1])]
+        n_pcs_score = min(7, weighted.shape[1])
+        if n_pcs_score <= 0:
+            return 0.0
+
+        scores_direct = [
+            self._coverage_score(weighted[:, i], selected_indexes, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+        return float(np.mean(scores_direct))
+
+    def _source_counts(self, structures: list[ElectrolyteStructure]) -> dict[str, int]:
+        counts = {"hiphive": 0, "uma": 0, "other": 0}
+        for item in structures:
+            engine = str(item.source_engine or "other").lower()
+            if engine in {"hiphive", "uma"}:
+                counts[engine] += 1
+            else:
+                counts["other"] += 1
+        return counts
+
+    def _condition_counts(self, structures: list[ElectrolyteStructure]) -> tuple[dict[str, int], dict[str, int]]:
+        tp_counts: dict[str, int] = defaultdict(int)
+        li_counts: dict[str, int] = defaultdict(int)
+        for item in structures:
+            temperature = int(item.temperature_k or 300)
+            pressure_mpa = self._pressure_mpa_for_temperature(temperature)
+            tp_key = f"T{temperature}K_P{pressure_mpa:.2f}MPa"
+            tp_counts[tp_key] += 1
+            li_key = f"LiOH_{float(item.li_molality):.2f}"
+            li_counts[li_key] += 1
+        return dict(tp_counts), dict(li_counts)
+
+    def _plot_source_contribution_by_option(
+        self,
+        option_pool_counts: dict[str, dict[str, int]],
+        option_selected_counts: dict[str, dict[str, int]],
+        metrics_dir: Path,
+    ) -> None:
+        options = ["hiphive", "uma", "combined"]
+        labels = [name for name in options if name in option_pool_counts]
+        if not labels:
+            return
+
+        engines = ["hiphive", "uma"]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+        for ax, source_map, title in [
+            (axes[0], option_pool_counts, "Pre-DIRECT pool"),
+            (axes[1], option_selected_counts, "DIRECT selected"),
+        ]:
+            x = np.arange(len(labels))
+            width = 0.35
+            for idx, engine in enumerate(engines):
+                values = [source_map[label].get(engine, 0) for label in labels]
+                ax.bar(x + (idx - 0.5) * width, values, width=width, label=engine.upper())
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.set_title(title)
+            ax.set_ylabel("Structure count")
+            ax.legend(frameon=False)
+
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "source_contribution_by_option.png", dpi=200)
+        plt.close()
+
+    def _plot_condition_distribution_by_option(
+        self,
+        option_tp_counts: dict[str, dict[str, int]],
+        option_li_counts: dict[str, dict[str, int]],
+        metrics_dir: Path,
+    ) -> None:
+        options = ["hiphive", "uma", "combined"]
+        ordered_options = [opt for opt in options if opt in option_tp_counts]
+        if not ordered_options:
+            return
+
+        all_tp_keys = sorted({key for counts in option_tp_counts.values() for key in counts})
+        all_li_keys = sorted({key for counts in option_li_counts.values() for key in counts})
+
+        fig, axes = plt.subplots(len(ordered_options), 1, figsize=(12, 3.2 * len(ordered_options)), squeeze=False)
+        for row, option in enumerate(ordered_options):
+            values = [option_tp_counts[option].get(key, 0) for key in all_tp_keys]
+            ax = axes[row, 0]
+            ax.bar(range(len(all_tp_keys)), values)
+            ax.set_title(f"{option}: DIRECT-selected T/P distribution")
+            ax.set_ylabel("Count")
+            ax.set_xticks(range(len(all_tp_keys)))
+            ax.set_xticklabels(all_tp_keys, rotation=45, ha="right", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "selected_temperature_pressure_distribution.png", dpi=220)
+        plt.close()
+
+        fig, axes = plt.subplots(len(ordered_options), 1, figsize=(11, 3.0 * len(ordered_options)), squeeze=False)
+        for row, option in enumerate(ordered_options):
+            values = [option_li_counts[option].get(key, 0) for key in all_li_keys]
+            ax = axes[row, 0]
+            ax.bar(range(len(all_li_keys)), values)
+            ax.set_title(f"{option}: DIRECT-selected LiOH concentration distribution")
+            ax.set_ylabel("Count")
+            ax.set_xticks(range(len(all_li_keys)))
+            ax.set_xticklabels(all_li_keys, rotation=45, ha="right", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "selected_li_concentration_distribution.png", dpi=220)
+        plt.close()
+
+    def _select_best_training_set_from_all_mode(
+        self,
+        rattled_candidates: list[ElectrolyteStructure],
+    ) -> list[ElectrolyteStructure]:
+        engine_pools: dict[str, list[ElectrolyteStructure]] = {
+            engine: [item for item in rattled_candidates if (item.source_engine or "").lower() == engine]
+            for engine in ["hiphive", "uma"]
+        }
+        option_pools: dict[str, list[ElectrolyteStructure]] = {
+            **engine_pools,
+            "combined": rattled_candidates,
+        }
+
+        comparison: dict[str, dict] = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "options": {},
+        }
+        selected_by_option: dict[str, list[ElectrolyteStructure]] = {}
+        options_dir = self.args.output_dir / "training_set_options"
+        metrics_root = self.args.output_dir / "direct_metrics"
+        metrics_root.mkdir(parents=True, exist_ok=True)
+
+        option_pool_source_counts: dict[str, dict[str, int]] = {}
+        option_selected_source_counts: dict[str, dict[str, int]] = {}
+        option_tp_counts: dict[str, dict[str, int]] = {}
+        option_li_counts: dict[str, dict[str, int]] = {}
+
+        for option_name, pool in option_pools.items():
+            if not pool:
+                comparison["options"][option_name] = {
+                    "pool_size": 0,
+                    "selected_size": 0,
+                    "direct_mean_coverage_score": 0.0,
+                    "source_counts_pool": self._source_counts([]),
+                    "source_counts_selected": self._source_counts([]),
+                }
+                continue
+
+            selected = self.select_with_direct(pool)
+            selected_by_option[option_name] = selected
+            score = self._direct_mean_coverage_score(pool, selected)
+
+            pool_source = self._source_counts(pool)
+            selected_source = self._source_counts(selected)
+            tp_counts, li_counts = self._condition_counts(selected)
+
+            option_pool_source_counts[option_name] = pool_source
+            option_selected_source_counts[option_name] = selected_source
+            option_tp_counts[option_name] = tp_counts
+            option_li_counts[option_name] = li_counts
+
+            comparison["options"][option_name] = {
+                "pool_size": int(len(pool)),
+                "selected_size": int(len(selected)),
+                "direct_mean_coverage_score": float(score),
+                "source_counts_pool": pool_source,
+                "source_counts_selected": selected_source,
+                "selected_temperature_pressure_counts": tp_counts,
+                "selected_li_concentration_counts": li_counts,
+            }
+
+            option_dir = options_dir / option_name
+            self.write_structures(selected, base_dir=option_dir)
+            self.plot_direct_metrics(pool, selected, metrics_dir=metrics_root / f"option_{option_name}")
+
+        if not selected_by_option:
+            raise RuntimeError("No candidate pools available for all-mode DIRECT comparison.")
+
+        self._plot_source_contribution_by_option(
+            option_pool_counts=option_pool_source_counts,
+            option_selected_counts=option_selected_source_counts,
+            metrics_dir=metrics_root,
+        )
+        self._plot_condition_distribution_by_option(
+            option_tp_counts=option_tp_counts,
+            option_li_counts=option_li_counts,
+            metrics_dir=metrics_root,
+        )
+
+        best_option = max(
+            selected_by_option.keys(),
+            key=lambda name: comparison["options"][name]["direct_mean_coverage_score"],
+        )
+        best_structures = selected_by_option[best_option]
+        comparison["best_option"] = best_option
+
+        summary_path = metrics_root / "training_set_comparison.json"
+        summary_path.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+        print(
+            f"[DIRECT all-mode] best option={best_option}, score={comparison['options'][best_option]['direct_mean_coverage_score']:.4f}"
+        )
+        return best_structures
+
+    def plot_direct_metrics(
+        self,
+        all_structures: list[ElectrolyteStructure],
+        selected_structures: list[ElectrolyteStructure],
+        metrics_dir: Path | None = None,
+    ) -> None:
+        if not all_structures or not selected_structures:
+            return
+
+        all_features = np.array([self._compute_descriptor(item) for item in all_structures], dtype=float)
+        selected_features = np.array([self._compute_descriptor(item) for item in selected_structures], dtype=float)
+
+        selected_indexes: list[int] = []
+        used = set()
+        for sf in selected_features:
+            candidates = np.where(np.all(np.isclose(all_features, sf, atol=1e-8), axis=1))[0]
+            for idx in candidates:
+                if idx not in used:
+                    selected_indexes.append(int(idx))
+                    used.add(int(idx))
+                    break
+
+        metrics_dir = metrics_dir or (self.args.output_dir / "direct_metrics")
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        from sklearn.decomposition import PCA
+
+        n_components = min(30, all_features.shape[0], all_features.shape[1])
+        pca = PCA(n_components=n_components)
+        pca_features = pca.fit_transform(all_features)
+        explained_variance = pca.explained_variance_ratio_
+
+        plt.figure(figsize=(6, 4))
+        plt.plot(range(1, n_components + 1), explained_variance[:n_components] * 100, "o-")
+        plt.xlabel("i-th PC")
+        plt.ylabel("Explained variance")
+        ax = plt.gca()
+        ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "explained_variance.png", dpi=200)
+        plt.close()
+
+        weighted = pca_features[:, : min(7, pca_features.shape[1])]
+        if weighted.shape[1] >= 2:
+            plt.figure(figsize=(6, 6))
+            plt.plot(weighted[:, 0], weighted[:, 1], "*", alpha=0.4, label=f"All {len(weighted):,} structures")
+            sel = weighted[selected_indexes]
+            plt.plot(sel[:, 0], sel[:, 1], "*", alpha=0.6, label=f"DIRECT selected {len(sel):,}")
+            plt.xlabel("PC 1")
+            plt.ylabel("PC 2")
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(metrics_dir / "pca_coverage_direct.png", dpi=200)
+            plt.close()
+
+            manual_selection_index = [int(i) for i in np.linspace(0, len(weighted) - 1, len(selected_indexes))]
+            plt.figure(figsize=(6, 6))
+            plt.plot(weighted[:, 0], weighted[:, 1], "*", alpha=0.4, label=f"All {len(weighted):,} structures")
+            man = weighted[manual_selection_index]
+            plt.plot(man[:, 0], man[:, 1], "*", alpha=0.6, label=f"Manual selected {len(man):,}")
+            plt.xlabel("PC 1")
+            plt.ylabel("PC 2")
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(metrics_dir / "pca_coverage_manual.png", dpi=200)
+            plt.close()
+
+        n_pcs_score = min(7, weighted.shape[1])
+        scores_direct = [
+            self._coverage_score(weighted[:, i], selected_indexes, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+        manual_selection_index = [int(i) for i in np.linspace(0, len(weighted) - 1, len(selected_indexes))]
+        scores_manual = [
+            self._coverage_score(weighted[:, i], manual_selection_index, n_bins=100)
+            for i in range(n_pcs_score)
+        ]
+
+        x = np.arange(n_pcs_score)
+        plt.figure(figsize=(10, 4))
+        plt.bar(
+            x + 0.2,
+            scores_direct,
+            width=0.35,
+            label=f"DIRECT (mean={np.mean(scores_direct):.3f})",
+        )
+        plt.bar(
+            x - 0.2,
+            scores_manual,
+            width=0.35,
+            label=f"Manual (mean={np.mean(scores_manual):.3f})",
+        )
+        plt.xticks(x, [f"PC {i+1}" for i in range(n_pcs_score)])
+        plt.ylim(0, 1.05)
+        plt.ylabel("Coverage score")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(metrics_dir / "coverage_scores.png", dpi=200)
+        plt.close()
+
+    def _coverage_score(self, values: np.ndarray, selected_indexes: list[int], n_bins: int = 100) -> float:
+        selected_values = values[selected_indexes]
+        bins = np.linspace(float(np.min(values)), float(np.max(values)), n_bins)
+        n_all = np.count_nonzero(np.histogram(values, bins=bins)[0])
+        n_sel = np.count_nonzero(np.histogram(selected_values, bins=bins)[0])
+        if n_all == 0:
+            return 0.0
+        return n_sel / n_all
 
     def select_with_direct(self, structures: list[ElectrolyteStructure]) -> list[ElectrolyteStructure]:
         if len(structures) <= self.args.max_structures:
