@@ -5,8 +5,10 @@ import json
 import math
 import random
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -62,31 +64,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--solvent",
         type=str,
-        required=True,
+        default="H2O=default_structures/electrolyte_templates/H2O.cif",
         help="Solvent template in 'name=path' format (e.g., H2O=for_chat_gpt/H2O.bgf)",
     )
     parser.add_argument(
         "--li-template",
         type=str,
-        required=True,
+        default="Li=default_structures/electrolyte_templates/Li.cif",
         help="Li+ template in 'name=path' format (e.g., Li=for_chat_gpt/Li.bgf)",
     )
     parser.add_argument(
         "--k-template",
         type=str,
-        required=True,
+        default="K=default_structures/electrolyte_templates/K.cif",
         help="K+ template in 'name=path' format (e.g., K=for_chat_gpt/K.bgf)",
     )
     parser.add_argument(
         "--oh-template",
         type=str,
-        required=True,
+        default="OH=default_structures/electrolyte_templates/OH.cif",
         help="OH- template in 'name=path' format (e.g., OH=for_chat_gpt/OH.bgf)",
     )
     parser.add_argument(
         "--li-k-concentrations",
         type=str,
-        required=True,
+        default="4/0,3.5/0.5,3/1,2.5/1.5,2/2,1.5/2.5,1/3,0.5/3.5,0/4",
         help=(
             "Comma-separated LiOH/KOH molality pairs in mol/kg-solvent, "
             "e.g. '4/0,3.5/0.5,3/1,2.5/1.5,2/2,1.5/2.5,1/3,0.5/3.5,0/4'"
@@ -115,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rattle-method", choices=["mc", "gaussian"], default="mc")
     parser.add_argument("--md-ensemble", choices=["nvt", "npt"], default="npt")
     parser.add_argument("--md-steps", type=int, default=500)
+    parser.add_argument(
+        "--md-total-steps",
+        type=int,
+        default=60000,
+        help="Total UMA MD step budget distributed proportionally across all MD runs.",
+    )
     parser.add_argument("--md-sample-interval", type=int, default=10)
     parser.add_argument("--md-timestep-fs", type=float, default=1.0)
     parser.add_argument("--md-friction-per-fs", type=float, default=0.001)
@@ -149,14 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--temperatures",
         type=int,
         nargs="*",
-        default=[250, 300, 600, 900, 1200],
+        default=[393, 433, 473, 493],
         help="Default temperature set mirrors electrode generation defaults.",
     )
     parser.add_argument(
         "--pressures-mpa",
         type=float,
         nargs="*",
-        default=None,
+        default=[0.08, 0.46, 1.32, 2.02],
         help="Optional pressure values aligned with --temperatures; default is 0.1 MPa if omitted.",
     )
     parser.add_argument("--direct-threshold-init", type=float, default=0.05)
@@ -212,6 +220,11 @@ class ElectrolyteStructureGenerationPipeline:
         self.args = args
         self.base_cfg = default_electrode_generation_config()
         self.adaptor = AseAtomsAdaptor()
+
+        if self.args.md_total_steps <= 0:
+            raise ValueError("--md-total-steps must be > 0")
+        if self.args.pressures_mpa is not None and len(self.args.pressures_mpa) != len(self.args.temperatures):
+            raise ValueError("--pressures-mpa must have same length as --temperatures")
 
         self.solvent_name, self.solvent_path = _parse_named_path(args.solvent)
         self.li_name, self.li_path = _parse_named_path(args.li_template)
@@ -714,11 +727,196 @@ class ElectrolyteStructureGenerationPipeline:
         required_by_sampling = required_samples * sample_interval
         return max(required_by_sampling, int(self.args.md_steps))
 
+    def _allocate_md_steps_per_run(self, run_structure_targets: list[int]) -> list[int]:
+        if not run_structure_targets:
+            return []
+        min_per_run = max(1, int(self.args.md_sample_interval))
+        min_total = min_per_run * len(run_structure_targets)
+        budget = max(min_total, int(self.args.md_total_steps))
+        weights = [max(1, int(value)) for value in run_structure_targets]
+        allocations = [min_per_run for _ in run_structure_targets]
+        remaining = budget - min_total
+        if remaining <= 0:
+            return allocations
+
+        total_weight = float(sum(weights))
+        raw_extra = [remaining * (w / total_weight) for w in weights]
+        floor_extra = [int(math.floor(v)) for v in raw_extra]
+        for idx, extra in enumerate(floor_extra):
+            allocations[idx] += extra
+
+        assigned = sum(floor_extra)
+        leftovers = remaining - assigned
+        if leftovers > 0:
+            frac_order = sorted(
+                range(len(weights)),
+                key=lambda i: (raw_extra[i] - floor_extra[i]),
+                reverse=True,
+            )
+            for i in frac_order[:leftovers]:
+                allocations[i] += 1
+        return allocations
+
+    def _md_stats_dir(self) -> Path:
+        stats_dir = self.args.output_dir / "md_runtime_stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        return stats_dir
+
+    def _md_stats_path(self) -> Path:
+        return self._md_stats_dir() / "md_progress_uma.json"
+
+    def _init_md_runtime_stats(
+        self,
+        target_count: int,
+        target_per_bin: dict[tuple[int, str], int],
+        pressure_per_bin: dict[tuple[int, str], float | None] | None = None,
+    ) -> None:
+        now = time.time()
+        self._md_runtime_state = {
+            "backend": "uma",
+            "status": "running",
+            "error_message": None,
+            "start_epoch_s": now,
+            "last_update_epoch_s": now,
+            "target_structures": int(target_count),
+            "completed_structures": 0,
+            "rate_structures_per_min": 0.0,
+            "eta_seconds": None,
+            "eta_utc": None,
+            "bins": {
+                f"T{temperature}_conc_{concentration}": {
+                    "temperature_k": int(temperature),
+                    "concentration_label": concentration,
+                    "pressure_mpa": (
+                        float(pressure_per_bin[(temperature, concentration)])
+                        if pressure_per_bin is not None and pressure_per_bin.get((temperature, concentration)) is not None
+                        else None
+                    ),
+                    "target_structures": int(n),
+                    "completed_structures": 0,
+                    "base_index": 0,
+                    "base_total": 0,
+                    "md_steps_done": 0,
+                    "md_steps_total": 0,
+                    "snapshots_captured": 0,
+                    "stage": "pending",
+                    "error_message": None,
+                }
+                for (temperature, concentration), n in sorted(target_per_bin.items(), key=lambda x: (x[0][0], x[0][1]))
+            },
+        }
+        self._write_md_runtime_stats()
+
+    def _update_md_runtime_stats(
+        self,
+        temperature: int,
+        concentration_label: str,
+        stage: str,
+        completed_delta: int,
+        base_index: int,
+        base_total: int,
+        md_steps_done: int,
+        md_steps_total: int,
+        snapshots_captured: int,
+    ) -> None:
+        state = getattr(self, "_md_runtime_state", None)
+        if state is None:
+            return
+
+        key = f"T{temperature}_conc_{concentration_label}"
+        bin_state = state["bins"].get(key)
+        if bin_state is None:
+            return
+
+        if completed_delta:
+            state["completed_structures"] += int(completed_delta)
+            bin_state["completed_structures"] += int(completed_delta)
+
+        bin_state["base_index"] = int(base_index)
+        bin_state["base_total"] = int(base_total)
+        bin_state["md_steps_done"] = int(md_steps_done)
+        bin_state["md_steps_total"] = int(md_steps_total)
+        bin_state["snapshots_captured"] = int(snapshots_captured)
+        bin_state["stage"] = stage
+        bin_state["error_message"] = None
+
+        now = time.time()
+        elapsed = max(now - state["start_epoch_s"], 1e-9)
+        completed = int(state["completed_structures"])
+        target = int(state["target_structures"])
+        rate_per_sec = completed / elapsed
+        state["rate_structures_per_min"] = float(rate_per_sec * 60.0)
+        remaining = max(target - completed, 0)
+        if rate_per_sec > 0 and remaining > 0:
+            eta_seconds = remaining / rate_per_sec
+            eta_epoch = now + eta_seconds
+            state["eta_seconds"] = float(eta_seconds)
+            state["eta_utc"] = datetime.fromtimestamp(eta_epoch, tz=timezone.utc).isoformat()
+        elif remaining == 0:
+            state["eta_seconds"] = 0.0
+            state["eta_utc"] = datetime.now(timezone.utc).isoformat()
+        else:
+            state["eta_seconds"] = None
+            state["eta_utc"] = None
+
+        state["last_update_epoch_s"] = now
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+        self._write_md_runtime_stats()
+
+    def _finalize_md_runtime_stats(self, final_count: int, target_count: int) -> None:
+        state = getattr(self, "_md_runtime_state", None)
+        if state is None:
+            return
+        state["completed_structures"] = int(final_count)
+        state["target_structures"] = int(target_count)
+        state["status"] = "completed"
+        state["eta_seconds"] = 0.0
+        state["eta_utc"] = datetime.now(timezone.utc).isoformat()
+        state["last_update_epoch_s"] = time.time()
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+        self._write_md_runtime_stats()
+
+    def _fail_md_runtime_stats(
+        self,
+        error_message: str,
+        temperature: int | None = None,
+        concentration_label: str | None = None,
+    ) -> None:
+        state = getattr(self, "_md_runtime_state", None)
+        if state is None:
+            return
+
+        state["status"] = "failed"
+        state["error_message"] = str(error_message)
+        state["eta_seconds"] = None
+        state["eta_utc"] = None
+        state["last_update_epoch_s"] = time.time()
+        state["last_update_utc"] = datetime.now(timezone.utc).isoformat()
+
+        if temperature is not None and concentration_label is not None:
+            key = f"T{temperature}_conc_{concentration_label}"
+            bin_state = state.get("bins", {}).get(key)
+            if bin_state is not None:
+                bin_state["stage"] = "failed"
+                bin_state["error_message"] = str(error_message)
+
+        self._write_md_runtime_stats()
+
+    def _write_md_runtime_stats(self) -> None:
+        state = getattr(self, "_md_runtime_state", None)
+        if state is None:
+            return
+        self._md_stats_path().write_text(json.dumps(state, indent=2), encoding="utf-8")
+
     def _select_even_snapshots(self, snapshots, n_keep: int, seed: int):
         if n_keep <= 0 or not snapshots:
             return []
         if len(snapshots) <= n_keep:
-            return [snapshots[i].copy() for i in range(len(snapshots))]
+            selected = [snapshots[i].copy() for i in range(len(snapshots))]
+            rng = random.Random(seed + 7919)
+            while len(selected) < n_keep:
+                selected.append(snapshots[rng.randrange(len(snapshots))].copy())
+            return selected
         rng = random.Random(seed)
         indices = list(range(len(snapshots)))
         selected = sorted(rng.sample(indices, n_keep))
@@ -726,7 +924,7 @@ class ElectrolyteStructureGenerationPipeline:
 
     def _md_output_paths(self, temperature: int, concentration_label: str, base_idx: int) -> tuple[Path, Path]:
         safe_label = concentration_label.replace("/", "_")
-        out_dir = self.args.output_dir / "md_runs" / f"T_{temperature}K" / safe_label
+        out_dir = self.args.output_dir / "md_runs" / "engine_uma" / f"T_{temperature}K" / safe_label
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = f"base_{base_idx:08d}"
         return out_dir / f"{stem}.extxyz", out_dir / f"{stem}_properties.csv"
@@ -741,6 +939,7 @@ class ElectrolyteStructureGenerationPipeline:
         seed: int,
         pressure_mpa: float | None = None,
         progress_callback=None,
+        md_steps_override: int | None = None,
     ):
         from ase import units
         from ase.io import write
@@ -770,7 +969,9 @@ class ElectrolyteStructureGenerationPipeline:
         sample_interval = int(self.args.md_sample_interval)
 
         log_file = prop_log_path.open("w", encoding="utf-8")
-        log_file.write("step,temperature_K,pressure_GPa,kinetic_energy_eV,potential_energy_eV,total_energy_eV\n")
+        log_file.write(
+            "step,temperature_K,pressure_GPa,volume_A3,density_g_cm3,kinetic_energy_eV,potential_energy_eV,total_energy_eV\n"
+        )
 
         timestep = self.args.md_timestep_fs * units.fs
         if self.args.md_ensemble == "npt":
@@ -811,15 +1012,18 @@ class ElectrolyteStructureGenerationPipeline:
             potential = float(atoms.get_potential_energy())
             total = kinetic + potential
             temperature_k = float(atoms.get_temperature())
+            volume_a3 = float(atoms.get_volume())
+            mass_amu = float(np.sum(atoms.get_masses()))
+            density_g_cm3 = mass_amu * 1.66053906660 / max(volume_a3, 1e-12)
             log_file.write(
-                f"{step_counter['value']},{temperature_k:.8f},{pressure_gpa:.8f},{kinetic:.8f},{potential:.8f},{total:.8f}\n"
+                f"{step_counter['value']},{temperature_k:.8f},{pressure_gpa:.8f},{volume_a3:.8f},{density_g_cm3:.8f},{kinetic:.8f},{potential:.8f},{total:.8f}\n"
             )
             log_file.flush()
             step_counter["value"] += sample_interval
 
         dyn.attach(_capture, interval=sample_interval)
         dyn.attach(_log_properties, interval=sample_interval)
-        n_steps = self._required_md_steps(n_structures)
+        n_steps = int(md_steps_override) if md_steps_override is not None else self._required_md_steps(n_structures)
 
         if progress_callback is not None:
             def _progress_hook():
@@ -849,6 +1053,21 @@ class ElectrolyteStructureGenerationPipeline:
         bins = [(t, c) for t in self.args.temperatures for c in sorted(grouped.keys())]
         per_bin = target_count // len(bins)
         rem = target_count % len(bins)
+        target_per_bin: dict[tuple[int, str], int] = {}
+        for idx, key in enumerate(bins):
+            target_per_bin[key] = per_bin + (1 if idx < rem else 0)
+
+        pressure_per_bin: dict[tuple[int, str], float | None] | None = None
+        if self.args.md_ensemble == "npt":
+            pressure_per_bin = {
+                (temperature, conc): self._pressure_mpa_for_temperature(temperature)
+                for (temperature, conc) in bins
+            }
+        self._init_md_runtime_stats(
+            target_count=target_count,
+            target_per_bin=target_per_bin,
+            pressure_per_bin=pressure_per_bin,
+        )
 
         try:
             from tqdm.auto import tqdm
@@ -856,9 +1075,32 @@ class ElectrolyteStructureGenerationPipeline:
             tqdm = None
 
         expanded: list[ElectrolyteStructure] = []
+        total_runs = 0
+        run_structure_targets: list[int] = []
+        for (temperature, conc) in bins:
+            n_bin = target_per_bin[(temperature, conc)]
+            base = grouped[conc]
+            max_bases = min(self.args.max_base_structures_per_bin, len(base))
+            base_work = [n_bin // max_bases] * max_bases
+            for i in range(n_bin % max_bases):
+                base_work[i] += 1
+            for n_structures in base_work:
+                if n_structures > 0:
+                    total_runs += 1
+                    run_structure_targets.append(n_structures)
+
+        run_step_budgets = self._allocate_md_steps_per_run(run_structure_targets)
+        run_budget_idx = 0
+        completed_runs = 0
+        total_pbar = (
+            tqdm(total=target_count, desc="UMA MD total", leave=True)
+            if tqdm is not None
+            else None
+        )
+
         for idx, (temperature, conc) in enumerate(bins):
             bin_generated: list[ElectrolyteStructure] = []
-            n_bin = per_bin + (1 if idx < rem else 0)
+            n_bin = target_per_bin[(temperature, conc)]
             base = grouped[conc]
             max_bases = min(self.args.max_base_structures_per_bin, len(base))
             base_work = [n_bin // max_bases] * max_bases
@@ -875,12 +1117,38 @@ class ElectrolyteStructureGenerationPipeline:
                 n_structures = base_work[base_idx]
                 if n_structures <= 0:
                     continue
+                md_steps_budget = run_step_budgets[run_budget_idx]
+                run_budget_idx += 1
                 atoms = self.adaptor.get_atoms(base_item.structure)
                 seed = self._bounded_seed(13_000_003 * temperature + 127 * base_item.candidate_index + 29)
                 fraction = float(self.args.md_frame_select_fraction)
                 live_progress = {"selected_equiv": 0}
+                step_progress = {"prev_steps": 0, "prev_time": time.time(), "step_rate": 0.0}
+
+                self._update_md_runtime_stats(
+                    temperature=temperature,
+                    concentration_label=conc,
+                    stage="base_start",
+                    completed_delta=0,
+                    base_index=base_idx + 1,
+                    base_total=max_bases,
+                    md_steps_done=0,
+                    md_steps_total=0,
+                    snapshots_captured=0,
+                )
 
                 def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
+                    self._update_md_runtime_stats(
+                        temperature=temperature,
+                        concentration_label=conc,
+                        stage=stage,
+                        completed_delta=0,
+                        base_index=base_idx + 1,
+                        base_total=max_bases,
+                        md_steps_done=md_steps_done,
+                        md_steps_total=md_steps_total,
+                        snapshots_captured=captured,
+                    )
                     if pbar is None or stage != "running":
                         return
                     estimated_selected = min(
@@ -890,20 +1158,61 @@ class ElectrolyteStructureGenerationPipeline:
                     delta = estimated_selected - live_progress["selected_equiv"]
                     if delta > 0:
                         pbar.update(delta)
+                        if total_pbar is not None:
+                            total_pbar.update(delta)
                         live_progress["selected_equiv"] = estimated_selected
 
-                snaps = self._run_uma_md_snapshots(
-                    atoms=atoms,
+                    now = time.time()
+                    step_delta = max(0, int(md_steps_done) - int(step_progress["prev_steps"]))
+                    dt = max(now - float(step_progress["prev_time"]), 1e-9)
+                    if step_delta > 0:
+                        step_progress["step_rate"] = float(step_delta / dt)
+                        step_progress["prev_steps"] = int(md_steps_done)
+                        step_progress["prev_time"] = now
+                    runs_left = max(total_runs - completed_runs - 1, 0)
+                    md_steps_left = max(md_steps_budget - int(md_steps_done), 0)
+                    postfix = f"runs_left={runs_left} md_left={md_steps_left} step/s={step_progress['step_rate']:.2f}"
+                    pbar.set_postfix_str(postfix)
+                    if total_pbar is not None:
+                        total_pbar.set_postfix_str(postfix)
+
+                try:
+                    snaps = self._run_uma_md_snapshots(
+                        atoms=atoms,
+                        temperature=temperature,
+                        concentration_label=conc,
+                        base_candidate_index=base_item.candidate_index,
+                        n_structures=n_structures,
+                        seed=seed,
+                        pressure_mpa=self._pressure_mpa_for_temperature(temperature),
+                        progress_callback=_progress_callback,
+                        md_steps_override=md_steps_budget,
+                    )
+                except Exception as exc:
+                    self._fail_md_runtime_stats(
+                        error_message=str(exc),
+                        temperature=temperature,
+                        concentration_label=conc,
+                    )
+                    raise
+                if pbar is not None and live_progress["selected_equiv"] < len(snaps):
+                    delta_final = len(snaps) - live_progress["selected_equiv"]
+                    pbar.update(delta_final)
+                    if total_pbar is not None:
+                        total_pbar.update(delta_final)
+
+                self._update_md_runtime_stats(
                     temperature=temperature,
                     concentration_label=conc,
-                    base_candidate_index=base_item.candidate_index,
-                    n_structures=n_structures,
-                    seed=seed,
-                    pressure_mpa=self._pressure_mpa_for_temperature(temperature),
-                    progress_callback=_progress_callback,
+                    stage="base_complete",
+                    completed_delta=len(snaps),
+                    base_index=base_idx + 1,
+                    base_total=max_bases,
+                    md_steps_done=md_steps_budget,
+                    md_steps_total=md_steps_budget,
+                    snapshots_captured=len(snaps),
                 )
-                if pbar is not None and live_progress["selected_equiv"] < len(snaps):
-                    pbar.update(len(snaps) - live_progress["selected_equiv"])
+
                 for sidx, snap in enumerate(snaps):
                     generated_item = ElectrolyteStructure(
                         structure=self.adaptor.get_structure(snap),
@@ -918,6 +1227,8 @@ class ElectrolyteStructureGenerationPipeline:
                     expanded.append(generated_item)
                     bin_generated.append(generated_item)
 
+                completed_runs += 1
+
             if pbar is not None:
                 pbar.close()
             if bin_generated:
@@ -925,6 +1236,10 @@ class ElectrolyteStructureGenerationPipeline:
                     bin_generated,
                     base_dir=self.args.output_dir / "rattled_pool" / "engine_uma",
                 )
+
+        self._finalize_md_runtime_stats(final_count=len(expanded), target_count=target_count)
+        if total_pbar is not None:
+            total_pbar.close()
 
         return expanded
 

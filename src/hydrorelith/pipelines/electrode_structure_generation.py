@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--md-ensemble", choices=["nvt", "npt"], default="nvt")
     parser.add_argument("--md-timestep-fs", type=float, default=1.0)
     parser.add_argument("--md-steps", type=int, default=500)
+    parser.add_argument(
+        "--md-total-steps-budget",
+        type=int,
+        default=60000,
+        help="Total UMA/MatGL MD step budget distributed proportionally across MD runs.",
+    )
     parser.add_argument("--md-sample-interval", type=int, default=10)
     parser.add_argument(
         "--md-frame-select-fraction",
@@ -143,13 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--temperatures",
         type=int,
         nargs="*",
-        default=[250, 300, 600, 900, 1200],
+        default=[393, 433, 473, 493],
     )
     parser.add_argument(
         "--pressures-mpa",
         type=float,
         nargs="*",
-        default=None,
+        default=[0.08, 0.46, 1.32, 2.02],
         help="Optional pressure values (MPa), matched by order with --temperatures.",
     )
     parser.add_argument("--auto-n-temperatures", type=int, default=5)
@@ -188,6 +194,7 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config.sampling.md_ensemble = args.md_ensemble
     config.sampling.md_timestep_fs = args.md_timestep_fs
     config.sampling.md_steps = args.md_steps
+    config.sampling.md_total_steps_budget = args.md_total_steps_budget
     config.sampling.md_sample_interval = args.md_sample_interval
     config.sampling.md_frame_select_fraction = args.md_frame_select_fraction
     config.sampling.md_min_step_multiplier = args.md_min_step_multiplier
@@ -319,6 +326,9 @@ class ElectrodeStructureGenerationPipeline:
 
         if self.config.sampling.md_steps <= 0:
             raise ValueError("--md-steps must be > 0")
+
+        if self.config.sampling.md_total_steps_budget <= 0:
+            raise ValueError("--md-total-steps-budget must be > 0")
 
         if self.config.sampling.md_sample_interval <= 0:
             raise ValueError("--md-sample-interval must be > 0")
@@ -885,6 +895,26 @@ class ElectrodeStructureGenerationPipeline:
             pressure_per_bin=pressure_per_bin,
         )
 
+        total_runs = 0
+        run_structure_targets: list[int] = []
+        for temperature in sorted({b[0] for b in bins}):
+            for lithiation in sorted({b[1] for b in bins if b[0] == temperature}, reverse=True):
+                n_bin = target_per_bin[(temperature, lithiation)]
+                base_candidates = list(by_lithiation[lithiation])
+                max_bases = min(self.config.sampling.max_base_structures_per_bin, len(base_candidates))
+                base_work = [n_bin // max_bases] * max_bases
+                for idx in range(n_bin % max_bases):
+                    base_work[idx] += 1
+                for n_structures in base_work:
+                    if n_structures > 0:
+                        total_runs += 1
+                        run_structure_targets.append(n_structures)
+
+        run_step_budgets = self._allocate_md_steps_per_run(run_structure_targets)
+        run_budget_idx = 0
+        completed_runs = 0
+        total_pbar = tqdm(total=target_count, desc=f"{backend.upper()} MD total", leave=True) if tqdm else None
+
         for temperature in sorted({b[0] for b in bins}):
             for lithiation in sorted({b[1] for b in bins if b[0] == temperature}, reverse=True):
                 n_bin = target_per_bin[(temperature, lithiation)]
@@ -907,9 +937,9 @@ class ElectrodeStructureGenerationPipeline:
                     n_structures = base_work[base_idx]
                     if n_structures <= 0:
                         completed_bases += 1
-                        if pbar is not None:
-                            pbar.update(1)
                         continue
+                    md_steps_budget = run_step_budgets[run_budget_idx]
+                    run_budget_idx += 1
 
                     cache_paths = self._cache_snapshot_paths(
                         engine=backend,
@@ -938,18 +968,24 @@ class ElectrodeStructureGenerationPipeline:
                             completed_delta=len(cached_structures),
                             base_index=base_idx + 1,
                             base_total=max_bases,
-                            md_steps_done=0,
-                            md_steps_total=0,
+                            md_steps_done=md_steps_budget,
+                            md_steps_total=md_steps_budget,
                             snapshots_captured=len(cached_structures),
                         )
                         if pbar is not None:
                             pbar.update(len(cached_structures))
+                        if total_pbar is not None:
+                            total_pbar.update(len(cached_structures))
                         completed_bases += 1
+                        completed_runs += 1
                         runs_left = max_bases - completed_bases
+                        global_runs_left = max(total_runs - completed_runs, 0)
                         avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
                         eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                         if pbar is not None:
-                            pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
+                            pbar.set_postfix_str(f"runs_left={runs_left} global_runs_left={global_runs_left} {self._eta_string(eta_seconds)}")
+                        if total_pbar is not None:
+                            total_pbar.set_postfix_str(f"runs_left={global_runs_left}")
                         continue
 
                     atoms = adaptor.get_atoms(base_item.structure)
@@ -957,6 +993,7 @@ class ElectrodeStructureGenerationPipeline:
                     start_base = time.time()
                     fraction = float(self.config.sampling.md_frame_select_fraction)
                     live_progress = {"selected_equiv": 0}
+                    step_progress = {"prev_steps": 0, "prev_time": time.time(), "step_rate": 0.0}
 
                     def _progress_callback(stage: str, captured: int, md_steps_done: int, md_steps_total: int) -> None:
                         self._update_md_runtime_stats(
@@ -979,7 +1016,22 @@ class ElectrodeStructureGenerationPipeline:
                             delta = estimated_selected - live_progress["selected_equiv"]
                             if delta > 0:
                                 pbar.update(delta)
+                                if total_pbar is not None:
+                                    total_pbar.update(delta)
                                 live_progress["selected_equiv"] = estimated_selected
+                            now = time.time()
+                            step_delta = max(0, int(md_steps_done) - int(step_progress["prev_steps"]))
+                            dt = max(now - float(step_progress["prev_time"]), 1e-9)
+                            if step_delta > 0:
+                                step_progress["step_rate"] = float(step_delta / dt)
+                                step_progress["prev_steps"] = int(md_steps_done)
+                                step_progress["prev_time"] = now
+                            global_runs_left = max(total_runs - completed_runs - 1, 0)
+                            md_steps_left = max(md_steps_budget - int(md_steps_done), 0)
+                            postfix = f"runs_left={global_runs_left} md_left={md_steps_left} step/s={step_progress['step_rate']:.2f}"
+                            pbar.set_postfix_str(postfix)
+                            if total_pbar is not None:
+                                total_pbar.set_postfix_str(postfix)
 
                     self._update_md_runtime_stats(
                         backend=backend,
@@ -1010,6 +1062,7 @@ class ElectrodeStructureGenerationPipeline:
                                 seed,
                                 pressure_mpa=pressure_mpa,
                                 progress_callback=_progress_callback,
+                                md_steps_override=md_steps_budget,
                             )
                         elif backend == "matgl":
                             snapshots = self._run_matgl_md_snapshots(
@@ -1020,6 +1073,7 @@ class ElectrodeStructureGenerationPipeline:
                                 n_structures,
                                 seed,
                                 progress_callback=_progress_callback,
+                                md_steps_override=md_steps_budget,
                             )
                         else:
                             raise ValueError(f"Unsupported MLFF backend: {backend}")
@@ -1046,18 +1100,25 @@ class ElectrodeStructureGenerationPipeline:
                     selected_structures = [adaptor.get_structure(snap_atoms) for snap_atoms in snapshots]
                     self._write_cached_structures(selected_structures, cache_paths)
                     if pbar is not None and live_progress["selected_equiv"] < len(snapshots):
-                        pbar.update(len(snapshots) - live_progress["selected_equiv"])
+                        delta_final = len(snapshots) - live_progress["selected_equiv"]
+                        pbar.update(delta_final)
+                        if total_pbar is not None:
+                            total_pbar.update(delta_final)
 
                     completed_bases += 1
+                    completed_runs += 1
                     elapsed = max(time.time() - start_base, 1e-9)
                     per_base_durations.append(elapsed)
                     if len(per_base_durations) > 10:
                         per_base_durations.pop(0)
                     runs_left = max_bases - completed_bases
+                    global_runs_left = max(total_runs - completed_runs, 0)
                     avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
                     eta_seconds = (avg_time * runs_left) if avg_time is not None else None
                     if pbar is not None:
-                        pbar.set_postfix_str(f"runs_left={runs_left} {self._eta_string(eta_seconds)}")
+                        pbar.set_postfix_str(f"runs_left={runs_left} global_runs_left={global_runs_left} {self._eta_string(eta_seconds)}")
+                    if total_pbar is not None:
+                        total_pbar.set_postfix_str(f"runs_left={global_runs_left}")
 
                     self._update_md_runtime_stats(
                         backend=backend,
@@ -1067,8 +1128,8 @@ class ElectrodeStructureGenerationPipeline:
                         completed_delta=len(snapshots),
                         base_index=base_idx + 1,
                         base_total=max_bases,
-                        md_steps_done=self._required_md_steps(n_structures),
-                        md_steps_total=self._required_md_steps(n_structures),
+                        md_steps_done=md_steps_budget,
+                        md_steps_total=md_steps_budget,
                         snapshots_captured=len(snapshots),
                     )
 
@@ -1078,6 +1139,8 @@ class ElectrodeStructureGenerationPipeline:
                     print(f"[progress] {backend} MD completed for {progress_desc}; base_runs={max_bases}")
 
         self._finalize_md_runtime_stats(backend=backend, final_count=len(expanded), target_count=target_count)
+        if total_pbar is not None:
+            total_pbar.close()
 
         if len(expanded) != target_count:
             raise RuntimeError(
@@ -1186,6 +1249,7 @@ class ElectrodeStructureGenerationPipeline:
         seed: int,
         pressure_mpa: float | None = None,
         progress_callback=None,
+        md_steps_override: int | None = None,
     ):
         from ase import units
         from ase.io import write
@@ -1216,7 +1280,7 @@ class ElectrodeStructureGenerationPipeline:
         sample_interval = int(self.config.sampling.md_sample_interval)
         log_file = prop_log_path.open("w", encoding="utf-8")
         log_file.write(
-            "step,temperature_K,pressure_GPa,kinetic_energy_eV,potential_energy_eV,total_energy_eV\n"
+            "step,temperature_K,pressure_GPa,volume_A3,density_g_cm3,kinetic_energy_eV,potential_energy_eV,total_energy_eV\n"
         )
 
         timestep = self.config.sampling.md_timestep_fs * units.fs
@@ -1260,15 +1324,18 @@ class ElectrodeStructureGenerationPipeline:
             potential = float(atoms.get_potential_energy())
             total = kinetic + potential
             temperature_k = float(atoms.get_temperature())
+            volume_a3 = float(atoms.get_volume())
+            mass_amu = float(np.sum(atoms.get_masses()))
+            density_g_cm3 = mass_amu * 1.66053906660 / max(volume_a3, 1e-12)
             log_file.write(
-                f"{step_counter['value']},{temperature_k:.8f},{pressure_gpa:.8f},{kinetic:.8f},{potential:.8f},{total:.8f}\n"
+                f"{step_counter['value']},{temperature_k:.8f},{pressure_gpa:.8f},{volume_a3:.8f},{density_g_cm3:.8f},{kinetic:.8f},{potential:.8f},{total:.8f}\n"
             )
             log_file.flush()
             step_counter["value"] += sample_interval
 
         dyn.attach(_capture, interval=sample_interval)
         dyn.attach(_log_properties, interval=sample_interval)
-        n_steps = self._required_md_steps(n_structures)
+        n_steps = int(md_steps_override) if md_steps_override is not None else self._required_md_steps(n_structures)
 
         if progress_callback is not None:
             def _progress_hook():
@@ -1298,6 +1365,7 @@ class ElectrodeStructureGenerationPipeline:
         n_structures: int,
         seed: int,
         progress_callback=None,
+        md_steps_override: int | None = None,
     ):
         import matgl
         from ase.io import write
@@ -1331,7 +1399,7 @@ class ElectrodeStructureGenerationPipeline:
         if native_traj_path.exists():
             native_traj_path.unlink()
 
-        n_steps = self._required_md_steps(n_structures)
+        n_steps = int(md_steps_override) if md_steps_override is not None else self._required_md_steps(n_structures)
         md = MolecularDynamics(
             atoms=atoms.copy(),
             potential=potential,
@@ -1409,13 +1477,49 @@ class ElectrodeStructureGenerationPipeline:
         required_by_sampling = required_samples * sample_interval
         return max(int(self.config.sampling.md_steps), required_by_sampling)
 
+    def _allocate_md_steps_per_run(self, run_structure_targets: list[int]) -> list[int]:
+        if not run_structure_targets:
+            return []
+        min_per_run = max(1, int(self.config.sampling.md_sample_interval))
+        min_total = min_per_run * len(run_structure_targets)
+        budget = max(min_total, int(self.config.sampling.md_total_steps_budget))
+        weights = [max(1, int(value)) for value in run_structure_targets]
+        allocations = [min_per_run for _ in run_structure_targets]
+        remaining = budget - min_total
+        if remaining <= 0:
+            return allocations
+
+        total_weight = float(sum(weights))
+        raw_extra = [remaining * (w / total_weight) for w in weights]
+        floor_extra = [int(math.floor(v)) for v in raw_extra]
+        for idx, extra in enumerate(floor_extra):
+            allocations[idx] += extra
+
+        assigned = sum(floor_extra)
+        leftovers = remaining - assigned
+        if leftovers > 0:
+            frac_order = sorted(
+                range(len(weights)),
+                key=lambda i: (raw_extra[i] - floor_extra[i]),
+                reverse=True,
+            )
+            for i in frac_order[:leftovers]:
+                allocations[i] += 1
+        return allocations
+
     def _select_even_snapshots(self, snapshots, n_keep: int, seed: int):
+        if n_keep <= 0 or not snapshots:
+            return []
         if len(snapshots) <= n_keep:
-            return snapshots
+            selected = [snap.copy() for snap in snapshots]
+            rng = random.Random(seed + 7919)
+            while len(selected) < n_keep:
+                selected.append(snapshots[rng.randrange(len(snapshots))].copy())
+            return selected
         rng = random.Random(seed)
         indices = list(range(len(snapshots)))
         selected = sorted(rng.sample(indices, n_keep))
-        return [snapshots[i] for i in selected]
+        return [snapshots[i].copy() for i in selected]
 
     def _split_counts(self, keys: list[str], total: int) -> dict[str, int]:
         base = total // len(keys)

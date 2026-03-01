@@ -3,7 +3,7 @@
 Repository backbone for a computational–experimental collaboration on hydrothermal relithiation. The project is designed to be material-agnostic while shipping with a default example pair:
 
 - Electrode: LCO (LiCoO2)
-- Electrolyte: LiOH/NaOH + H2O
+- Electrolyte: LiOH/KOH + H2O
 
 ## Project goal
 
@@ -62,13 +62,15 @@ New command:
 hrw-electrolyte-generate --help
 ```
 
-Key inputs are provided explicitly on CLI for reproducibility:
+Key inputs are available on CLI (with publication defaults pre-populated):
 
-- solvent template: `--solvent name=path`
-- ion templates: `--li-template`, `--k-template`, `--oh-template` (all in `name=path` format)
+- solvent template: `--solvent name=path` (default `H2O=default_structures/electrolyte_templates/H2O.cif`)
+- ion templates: `--li-template`, `--k-template`, `--oh-template` (defaults in `default_structures/electrolyte_templates/`)
 - concentration grid: `--li-k-concentrations "4/0,3.5/0.5,...,0/4"` (LiOH/KOH in mol/kg-solvent)
 - build constraints: `--max-atoms` and `--structures-per-concentration`
 - solvent density: `--solvent-density-g-cm3` (auto defaults to `1.0` for water-like solvent names)
+- publication temperature/pressure defaults: `393 433 473 493 K` with `0.08 0.46 1.32 2.02 MPa`
+- total UMA MD step budget: `--md-total-steps` (default `60000`, distributed across all MD runs)
 
 The pipeline:
 
@@ -104,14 +106,15 @@ Inputs accepted by the scaffold:
 - UMA device defaults to GPU (`--uma-device cuda`) when not provided
 - MD frame selection keeps a random fraction of sampled snapshots (`--md-frame-select-fraction`, default `0.10`)
 - MD run length enforces at least 4× sampled snapshots before selection (`--md-min-step-multiplier`, default `4.0`)
+- Total MLFF-MD step budget defaults to `60000` (`--md-total-steps-budget`) and is distributed across MD runs
 - MD runs are resumable: completed base snapshots are cached under `<output_dir>/rattling_cache/` and reused after interruption
 - MatGL model/backend controls (`--matgl-model-name`, `--matgl-backend auto|dgl|pyg`)
 - MatGL code paths are retained but temporarily disabled at runtime pending robust shared environment compatibility with `fairchem-core>=2.15.0`.
 - `md_execution=run` to execute immediately, or `--slurm-generate-only` to emit SLURM jobs
 - Temperature strategy:
-  - Fixed list default: `[250, 300, 600, 900, 1200]` K
+  - Fixed list default: `[393, 433, 473, 493]` K
   - Auto mode: 5 points between 250 K and 1.1 × melting temperature, forced inclusion of 300 K
-- Optional pressure list (MPa) aligned with temperature entries; used as target external pressure for UMA when `--md-ensemble npt`
+- Optional pressure list (MPa) aligned with temperature entries; publication default is `[0.08, 0.46, 1.32, 2.02]` for NPT runs
 
 Generation strategy:
 
@@ -180,7 +183,7 @@ Per-run MD artifacts are saved under:
 ```
 
 Trajectory files are written in OVITO-readable EXTXYZ format.
-The properties log includes step, temperature, pressure, kinetic energy, potential energy, and total energy (UMA runs).
+The properties log includes step, temperature, pressure, volume, density, kinetic energy, potential energy, and total energy (UMA runs).
 
 If `--slurm-generate-only` is used with MLFF-MD engines, scripts are written under:
 
@@ -210,6 +213,31 @@ PYTHONPATH=src python -m hydrorelith.pipelines.electrode_structure_generation \
 ```
 
 Use `--skip-direct` if you want to keep the full pre-DIRECT pool instead of down-selecting.
+
+Full publication command (electrode defaults for temperatures, pressures, structure counts, and MD budget):
+
+```bash
+PYTHONPATH=src hrw-electrode-generate \
+  --mpid mp-22526 \
+  --target-ion Li \
+  --supercell 3 3 3 \
+  --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation \
+  --rattle-engine all \
+  --uma-task-id omat \
+  --uma-device cuda \
+  --md-execution run \
+  --md-ensemble npt
+```
+
+Full publication command (electrolyte defaults for templates, concentrations, temperatures, pressures, and MD budget):
+
+```bash
+hrw-electrolyte-generate \
+  --output-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/structure_generation \
+  --rattle-engine all \
+  --md-ensemble npt \
+  --uma-device cuda
+```
 
 Output layout target:
 

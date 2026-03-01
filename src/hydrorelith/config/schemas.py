@@ -39,6 +39,7 @@ class SamplingConfig:
     md_ensemble: str = "nvt"
     md_timestep_fs: float = 1.0
     md_steps: int = 500
+    md_total_steps_budget: int = 60000
     md_sample_interval: int = 10
     md_frame_select_fraction: float = 0.10
     md_min_step_multiplier: float = 4.0
@@ -62,7 +63,7 @@ class TemperatureAutoConfig:
 @dataclass(slots=True)
 class TemperatureConfig:
     strategy: str = "fixed"
-    values: tuple[int, ...] = (250, 300, 600, 900, 1200)
+    values: tuple[int, ...] = (393, 433, 473, 493)
     pressures_mpa: dict[int, float] = field(default_factory=dict)
     auto: TemperatureAutoConfig = field(default_factory=TemperatureAutoConfig)
 
