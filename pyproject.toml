@@ -13,6 +13,7 @@ dependencies = [
   "scikit-learn>=1.6.1",
   "matplotlib",
   "tqdm",
+  "maml",
   "ase",
   "pymatgen",
   "hiphive",
@@ -22,9 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-electrode-generation = [
-  "maml",
-]
 matgl-dgl = [
   "dgl>=2.2.0,<2.5",
 ]

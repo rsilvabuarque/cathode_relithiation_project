@@ -262,10 +262,12 @@ hrw --help
 hrw-electrode-generate --help
 ```
 
+`maml` is required for DIRECT sampling in both electrode and electrolyte pipelines and is installed automatically by `pip install -e .`.
+
 Recommended clean install path for UMA + MatGL:
 
 ```bash
-python -m pip install "fairchem-core==2.15.0" matgl
+python -m pip install "fairchem-core==2.15.0" matgl maml
 # Install a DGL wheel matching your active torch/CUDA stack for CHGNet/QET models.
 # For fairchem-core 2.15.0, torch~=2.8.0 is expected.
 # Follow MatGL + DGL install docs to pick the correct wheel URL for your platform.

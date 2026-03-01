@@ -776,11 +776,36 @@ class ElectrodeStructureGenerationPipeline:
                 pbar = tqdm(total=max_bases, desc=f"hiPhive {progress_desc}", leave=False) if tqdm else None
                 per_base_durations: list[float] = []
                 completed_bases = 0
+                bin_generated: list[GeneratedStructure] = []
 
                 for base_idx, base_item in enumerate(selected_bases):
                     n_structures = base_work[base_idx]
                     if n_structures <= 0:
                         completed_bases += 1
+                        continue
+
+                    cache_paths = self._cache_snapshot_paths(
+                        engine="hiphive",
+                        temperature=temperature,
+                        lithiation=lithiation,
+                        base_candidate_index=base_item.candidate_index,
+                        n_structures=n_structures,
+                    )
+                    cached_structures = self._load_cached_structures(cache_paths)
+                    if cached_structures is not None and len(cached_structures) == n_structures:
+                        for snap_idx, cached_structure in enumerate(cached_structures):
+                            generated_item = GeneratedStructure(
+                                structure=cached_structure,
+                                lithiation_fraction=lithiation,
+                                temperature_k=temperature,
+                                candidate_index=base_item.candidate_index * 10_000 + snap_idx,
+                                source_engine="hiphive",
+                            )
+                            expanded.append(generated_item)
+                            bin_generated.append(generated_item)
+                        completed_bases += 1
+                        if pbar is not None:
+                            pbar.update(1)
                         continue
 
                     start_base = time.time()
@@ -816,16 +841,19 @@ class ElectrodeStructureGenerationPipeline:
                             n_iter=self.config.sampling.rattle_n_iter,
                         )
 
-                    for rattle_idx, rattled_atoms in enumerate(rattled_atoms_list):
-                        expanded.append(
-                            GeneratedStructure(
-                                structure=adaptor.get_structure(rattled_atoms),
-                                lithiation_fraction=lithiation,
-                                temperature_k=temperature,
-                                candidate_index=base_item.candidate_index * 10_000 + rattle_idx,
-                                source_engine="hiphive",
-                            )
+                    selected_structures = [adaptor.get_structure(rattled_atoms) for rattled_atoms in rattled_atoms_list]
+                    self._write_cached_structures(selected_structures, cache_paths)
+
+                    for rattle_idx, selected_structure in enumerate(selected_structures):
+                        generated_item = GeneratedStructure(
+                            structure=selected_structure,
+                            lithiation_fraction=lithiation,
+                            temperature_k=temperature,
+                            candidate_index=base_item.candidate_index * 10_000 + rattle_idx,
+                            source_engine="hiphive",
                         )
+                        expanded.append(generated_item)
+                        bin_generated.append(generated_item)
                     completed_bases += 1
                     elapsed = max(time.time() - start_base, 1e-9)
                     per_base_durations.append(elapsed)
@@ -842,6 +870,12 @@ class ElectrodeStructureGenerationPipeline:
                     pbar.close()
                 else:
                     print(f"[progress] hiPhive completed for {progress_desc}; base_runs={max_bases}")
+                if bin_generated:
+                    self.write_structures(
+                        bin_generated,
+                        base_dir=self.config.output.output_dir / "rattled_pool" / "engine_hiphive",
+                        include_engine_subdirs=False,
+                    )
 
         if len(expanded) != target_count:
             raise RuntimeError(
@@ -940,6 +974,7 @@ class ElectrodeStructureGenerationPipeline:
                         continue
                     md_steps_budget = run_step_budgets[run_budget_idx]
                     run_budget_idx += 1
+                    seed = 7_000_001 * temperature + 151 * base_item.candidate_index + 19
 
                     cache_paths = self._cache_snapshot_paths(
                         engine=backend,
@@ -988,8 +1023,55 @@ class ElectrodeStructureGenerationPipeline:
                             total_pbar.set_postfix_str(f"runs_left={global_runs_left}")
                         continue
 
+                    artifact_structures = self._load_structures_from_md_artifacts(
+                        engine=backend,
+                        temperature=temperature,
+                        lithiation=lithiation,
+                        base_candidate_index=base_item.candidate_index,
+                        n_structures=n_structures,
+                        seed=seed,
+                    )
+                    if artifact_structures is not None and len(artifact_structures) == n_structures:
+                        self._write_cached_structures(artifact_structures, cache_paths)
+                        for snap_idx, artifact_structure in enumerate(artifact_structures):
+                            expanded.append(
+                                GeneratedStructure(
+                                    structure=artifact_structure,
+                                    lithiation_fraction=lithiation,
+                                    temperature_k=temperature,
+                                    candidate_index=base_item.candidate_index * 100_000 + snap_idx,
+                                    source_engine=backend,
+                                )
+                            )
+                        self._update_md_runtime_stats(
+                            backend=backend,
+                            temperature=temperature,
+                            lithiation=lithiation,
+                            stage="base_artifact_cached",
+                            completed_delta=len(artifact_structures),
+                            base_index=base_idx + 1,
+                            base_total=max_bases,
+                            md_steps_done=md_steps_budget,
+                            md_steps_total=md_steps_budget,
+                            snapshots_captured=len(artifact_structures),
+                        )
+                        if pbar is not None:
+                            pbar.update(len(artifact_structures))
+                        if total_pbar is not None:
+                            total_pbar.update(len(artifact_structures))
+                        completed_bases += 1
+                        completed_runs += 1
+                        runs_left = max_bases - completed_bases
+                        global_runs_left = max(total_runs - completed_runs, 0)
+                        avg_time = float(np.mean(per_base_durations)) if per_base_durations else None
+                        eta_seconds = (avg_time * runs_left) if avg_time is not None else None
+                        if pbar is not None:
+                            pbar.set_postfix_str(f"runs_left={runs_left} global_runs_left={global_runs_left} {self._eta_string(eta_seconds)}")
+                        if total_pbar is not None:
+                            total_pbar.set_postfix_str(f"runs_left={global_runs_left}")
+                        continue
+
                     atoms = adaptor.get_atoms(base_item.structure)
-                    seed = 7_000_001 * temperature + 151 * base_item.candidate_index + 19
                     start_base = time.time()
                     fraction = float(self.config.sampling.md_frame_select_fraction)
                     live_progress = {"selected_equiv": 0}
@@ -1217,6 +1299,48 @@ class ElectrodeStructureGenerationPipeline:
             cache_dir / f"base_{base_candidate_index:08d}_snap_{snap_idx:04d}.cif"
             for snap_idx in range(n_structures)
         ]
+
+    def _load_structures_from_md_artifacts(
+        self,
+        engine: str,
+        temperature: int,
+        lithiation: float,
+        base_candidate_index: int,
+        n_structures: int,
+        seed: int,
+    ) -> list[Structure] | None:
+        traj_path, _ = self._md_run_output_paths(
+            engine=engine,
+            temperature=temperature,
+            lithiation=lithiation,
+            base_candidate_index=base_candidate_index,
+        )
+        if not traj_path.exists():
+            return None
+
+        try:
+            from ase.io import read
+        except Exception:
+            return None
+
+        try:
+            frames = read(str(traj_path), index=":")
+        except Exception:
+            return None
+
+        if frames is None:
+            return None
+        if not isinstance(frames, list):
+            frames = [frames]
+        if not frames:
+            return None
+
+        selected_atoms = self._select_even_snapshots(frames, n_structures, seed=seed)
+        if len(selected_atoms) != n_structures:
+            return None
+
+        adaptor = AseAtomsAdaptor()
+        return [adaptor.get_structure(atoms) for atoms in selected_atoms]
 
     def _load_cached_structures(self, paths: list[Path]) -> list[Structure] | None:
         if not paths or not all(path.exists() for path in paths):

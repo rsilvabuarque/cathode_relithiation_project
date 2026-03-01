@@ -621,6 +621,16 @@ class ElectrolyteStructureGenerationPipeline:
             bin_generated: list[ElectrolyteStructure] = []
             n_bin = per_bin + (1 if idx < rem else 0)
             base = grouped[conc]
+            preexisting = self._load_existing_rattled_bin(
+                engine="hiphive",
+                temperature=temperature,
+                concentration_label=conc,
+                n_expected=n_bin,
+                template_item=base[0],
+            )
+            if preexisting is not None:
+                expanded.extend(preexisting)
+                continue
             max_bases = min(self.args.max_base_structures_per_bin, len(base))
             base_work = [n_bin // max_bases] * max_bases
             for i in range(n_bin % max_bases):
@@ -636,6 +646,32 @@ class ElectrolyteStructureGenerationPipeline:
             for base_idx, base_item in enumerate(base[:max_bases]):
                 n_structures = base_work[base_idx]
                 if n_structures <= 0:
+                    continue
+                cache_paths = self._cache_snapshot_paths(
+                    engine="hiphive",
+                    temperature=temperature,
+                    concentration_label=conc,
+                    base_candidate_index=base_item.candidate_index,
+                    n_structures=n_structures,
+                )
+                cached_structures = self._load_cached_structures(cache_paths)
+                if cached_structures is not None and len(cached_structures) == n_structures:
+                    for ridx, cached_structure in enumerate(cached_structures):
+                        generated_item = ElectrolyteStructure(
+                            structure=cached_structure,
+                            concentration_label=base_item.concentration_label,
+                            li_molality=base_item.li_molality,
+                            k_molality=base_item.k_molality,
+                            density_g_cm3=base_item.density_g_cm3,
+                            temperature_k=temperature,
+                            candidate_index=base_item.candidate_index * 10_000 + ridx,
+                            source_engine="hiphive",
+                        )
+                        expanded.append(generated_item)
+                        bin_generated.append(generated_item)
+                    produced_bin += n_structures
+                    if pbar is not None:
+                        pbar.update(n_structures)
                     continue
                 atoms = self.adaptor.get_atoms(base_item.structure)
                 seed = self._bounded_seed(11_000_003 * temperature + 113 * base_item.candidate_index + 17)
@@ -677,9 +713,12 @@ class ElectrolyteStructureGenerationPipeline:
                                 seed=seed,
                             )
 
-                for ridx, rattled_atoms in enumerate(rattled):
+                selected_structures = [self.adaptor.get_structure(rattled_atoms) for rattled_atoms in rattled]
+                self._write_cached_structures(selected_structures, cache_paths)
+
+                for ridx, selected_structure in enumerate(selected_structures):
                     generated_item = ElectrolyteStructure(
-                        structure=self.adaptor.get_structure(rattled_atoms),
+                        structure=selected_structure,
                         concentration_label=base_item.concentration_label,
                         li_molality=base_item.li_molality,
                         k_molality=base_item.k_molality,
@@ -764,6 +803,77 @@ class ElectrolyteStructureGenerationPipeline:
 
     def _md_stats_path(self) -> Path:
         return self._md_stats_dir() / "md_progress_uma.json"
+
+    def _rattled_pool_bin_dir(self, engine: str, temperature: int, concentration_label: str) -> Path:
+        safe_label = concentration_label.replace("/", "_")
+        return self.args.output_dir / "rattled_pool" / f"engine_{engine}" / f"T_{temperature}K" / safe_label
+
+    def _cache_dir_for_bin(self, engine: str, temperature: int, concentration_label: str) -> Path:
+        safe_label = concentration_label.replace("/", "_")
+        return self.args.output_dir / "rattling_cache" / f"engine_{engine}" / f"T_{temperature}K" / safe_label
+
+    def _cache_snapshot_paths(
+        self,
+        engine: str,
+        temperature: int,
+        concentration_label: str,
+        base_candidate_index: int,
+        n_structures: int,
+    ) -> list[Path]:
+        cache_dir = self._cache_dir_for_bin(engine, temperature, concentration_label)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return [
+            cache_dir / f"base_{base_candidate_index:08d}_snap_{snap_idx:04d}.cif"
+            for snap_idx in range(n_structures)
+        ]
+
+    def _load_cached_structures(self, paths: list[Path]) -> list[Structure] | None:
+        if not paths or not all(path.exists() for path in paths):
+            return None
+        return [Structure.from_file(str(path)) for path in paths]
+
+    def _write_cached_structures(self, structures: list[Structure], paths: list[Path]) -> None:
+        if len(structures) != len(paths):
+            raise ValueError("Cached structure count does not match target path count.")
+        for structure, path in zip(structures, paths):
+            structure.to(fmt="cif", filename=str(path))
+
+    def _load_existing_rattled_bin(
+        self,
+        engine: str,
+        temperature: int,
+        concentration_label: str,
+        n_expected: int,
+        template_item: ElectrolyteStructure,
+    ) -> list[ElectrolyteStructure] | None:
+        if n_expected <= 0:
+            return []
+
+        bin_dir = self._rattled_pool_bin_dir(engine, temperature, concentration_label)
+        if not bin_dir.exists():
+            return None
+
+        cif_paths = sorted(bin_dir.glob("structure_*.cif"))
+        poscar_paths = sorted(bin_dir.glob("POSCAR_*"))
+        paths = cif_paths if cif_paths else poscar_paths
+        if len(paths) < n_expected:
+            return None
+
+        loaded: list[ElectrolyteStructure] = []
+        for idx, path in enumerate(paths[:n_expected]):
+            loaded.append(
+                ElectrolyteStructure(
+                    structure=Structure.from_file(str(path)),
+                    concentration_label=concentration_label,
+                    li_molality=template_item.li_molality,
+                    k_molality=template_item.k_molality,
+                    density_g_cm3=template_item.density_g_cm3,
+                    temperature_k=temperature,
+                    candidate_index=idx,
+                    source_engine=engine,
+                )
+            )
+        return loaded
 
     def _init_md_runtime_stats(
         self,
@@ -1107,6 +1217,34 @@ class ElectrolyteStructureGenerationPipeline:
             for i in range(n_bin % max_bases):
                 base_work[i] += 1
 
+            preexisting = self._load_existing_rattled_bin(
+                engine="uma",
+                temperature=temperature,
+                concentration_label=conc,
+                n_expected=n_bin,
+                template_item=base[0],
+            )
+            if preexisting is not None:
+                expanded.extend(preexisting)
+                skipped_runs = sum(1 for value in base_work if value > 0)
+                run_budget_idx += skipped_runs
+                completed_runs += skipped_runs
+                if total_pbar is not None:
+                    total_pbar.update(len(preexisting))
+                    total_pbar.set_postfix_str(f"runs_left={max(total_runs - completed_runs, 0)}")
+                self._update_md_runtime_stats(
+                    temperature=temperature,
+                    concentration_label=conc,
+                    stage="bin_cached",
+                    completed_delta=len(preexisting),
+                    base_index=max_bases,
+                    base_total=max_bases,
+                    md_steps_done=0,
+                    md_steps_total=0,
+                    snapshots_captured=len(preexisting),
+                )
+                continue
+
             pbar = (
                 tqdm(total=n_bin, desc=f"UMA MD T={temperature}K {conc}", leave=False)
                 if tqdm is not None
@@ -1119,6 +1257,45 @@ class ElectrolyteStructureGenerationPipeline:
                     continue
                 md_steps_budget = run_step_budgets[run_budget_idx]
                 run_budget_idx += 1
+                cache_paths = self._cache_snapshot_paths(
+                    engine="uma",
+                    temperature=temperature,
+                    concentration_label=conc,
+                    base_candidate_index=base_item.candidate_index,
+                    n_structures=n_structures,
+                )
+                cached_structures = self._load_cached_structures(cache_paths)
+                if cached_structures is not None and len(cached_structures) == n_structures:
+                    for sidx, cached_structure in enumerate(cached_structures):
+                        generated_item = ElectrolyteStructure(
+                            structure=cached_structure,
+                            concentration_label=conc,
+                            li_molality=base_item.li_molality,
+                            k_molality=base_item.k_molality,
+                            density_g_cm3=base_item.density_g_cm3,
+                            temperature_k=temperature,
+                            candidate_index=base_item.candidate_index * 100_000 + sidx,
+                            source_engine="uma",
+                        )
+                        expanded.append(generated_item)
+                        bin_generated.append(generated_item)
+                    if pbar is not None:
+                        pbar.update(len(cached_structures))
+                    if total_pbar is not None:
+                        total_pbar.update(len(cached_structures))
+                    self._update_md_runtime_stats(
+                        temperature=temperature,
+                        concentration_label=conc,
+                        stage="base_cached",
+                        completed_delta=len(cached_structures),
+                        base_index=base_idx + 1,
+                        base_total=max_bases,
+                        md_steps_done=md_steps_budget,
+                        md_steps_total=md_steps_budget,
+                        snapshots_captured=len(cached_structures),
+                    )
+                    completed_runs += 1
+                    continue
                 atoms = self.adaptor.get_atoms(base_item.structure)
                 seed = self._bounded_seed(13_000_003 * temperature + 127 * base_item.candidate_index + 29)
                 fraction = float(self.args.md_frame_select_fraction)
@@ -1226,6 +1403,11 @@ class ElectrolyteStructureGenerationPipeline:
                     )
                     expanded.append(generated_item)
                     bin_generated.append(generated_item)
+
+                self._write_cached_structures(
+                    [item.structure for item in bin_generated[-len(snaps):]],
+                    cache_paths,
+                )
 
                 completed_runs += 1
 
