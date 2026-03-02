@@ -78,6 +78,8 @@ The pipeline:
 2. Writes generation summary to `<output_dir>/electrolyte_generation_overview.json`.
 3. Optionally applies hiPhive rattling or UMA-MD and then DIRECT down-selection.
 
+For `--rattle-engine all`, each active engine now generates a full pre-DIRECT pool (`max_structures * oversampling_factor`) before option-wise DIRECT comparison (`hiphive`, `uma`, `combined`).
+
 For quick generation-only checks, use `--skip-rattling`.
 
 ## Electrode structure generation (scaffold)

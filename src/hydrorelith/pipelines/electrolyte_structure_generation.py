@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hiphive-rattle-fraction-in-all",
         type=float,
         default=0.40,
-        help="In all-mode, fraction of target pre-DIRECT pool assigned to hiPhive (UMA gets the remainder).",
+        help="Deprecated compatibility flag; ignored. In all-mode each engine now generates the full pre-DIRECT pool.",
     )
     parser.add_argument(
         "--temperatures",
@@ -572,14 +572,7 @@ class ElectrolyteStructureGenerationPipeline:
 
     def _target_count_for_engine(self, engine: str) -> int:
         base_target = int(self.args.max_structures * self.args.oversampling_factor)
-        if self.args.rattle_engine != "all":
-            return base_target
-
-        hip_frac = float(self.args.hiphive_rattle_fraction_in_all)
-        hip_frac = max(0.05, min(0.95, hip_frac))
-        hip_target = max(1, int(round(base_target * hip_frac)))
-        uma_target = max(1, base_target - hip_target)
-        return hip_target if engine == "hiphive" else uma_target
+        return base_target
 
     def generate_rattled_candidates(self, structures: list[ElectrolyteStructure], engine: str) -> list[ElectrolyteStructure]:
         target_count = self._target_count_for_engine(engine)
