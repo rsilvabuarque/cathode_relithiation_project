@@ -82,11 +82,83 @@ For `--rattle-engine all`, each active engine now generates a full pre-DIRECT po
 
 For quick generation-only checks, use `--skip-rattling`.
 
+## SCF parallelization benchmark tool (Perlmutter CPU node)
+
+New command:
+
+```bash
+hrw-scf-parallel-benchmark --help
+```
+
+Purpose:
+
+- Discover DIRECT-filtered structures from electrode/electrolyte `best_training_set` folders.
+- Sample a user-defined number of structures per system (default `3`).
+- Generate VASP benchmark cases for MPI/OMP, `KPAR`, and `NCORE` sweeps on a full Perlmutter CPU node.
+- Prepare a single Slurm script to run all benchmark cases (`run_all_parallel_benchmarks.slurm`).
+- Parse `OUTCAR`/`OSZICAR`, then write per-structure and averaged performance data plus plots.
+
+The tool uses INCAR templates from:
+
+- `for_chat_gpt/performance_analysis_input_files/electrode/INCAR_ELECTRODE`
+- `for_chat_gpt/performance_analysis_input_files/electrolyte/INCAR_ELECTROLYTE`
+
+For electrode systems, `MAGMOM` token replacement is automatic for `N_Li`, `N_Co`, and `N_O` using the selected structure composition.
+
+If `KPOINTS` templates are not present, the tool auto-generates gamma-only `KPOINTS` (`1x1x1`).
+If `POTCAR` templates are missing, cases are still generated and Slurm runs are marked as `missing_potcar` until `POTCAR` files are added.
+
+Generation example (3 structures per system, `NELM=15`):
+
+```bash
+hrw-scf-parallel-benchmark \
+  --electrode-structures-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation \
+  --electrolyte-structures-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/structure_generation \
+  --template-input-root for_chat_gpt/performance_analysis_input_files \
+  --n-structures 3 \
+  --scf-steps 15 \
+  --output-dir results/performance/scf_parallelization
+```
+
+Run on Perlmutter:
+
+```bash
+cd results/performance/scf_parallelization
+sbatch run_all_parallel_benchmarks.slurm
+```
+
+Analyze and plot after runs finish:
+
+```bash
+hrw-scf-parallel-benchmark \
+  --analyze-only \
+  --benchmark-root results/performance/scf_parallelization
+```
+
+Analysis outputs:
+
+```text
+<output_dir>/analysis/
+├── records_per_case.csv
+├── records_average.csv
+├── summary.json
+└── plots/
+    ├── electrode_mpi_omp_vs_cores.png
+    ├── electrode_kpar_sweep.png
+    ├── electrode_ncore_sweep.png
+    ├── electrode_parallel_efficiency.png
+    ├── electrolyte_mpi_omp_vs_cores.png
+    ├── electrolyte_kpar_sweep.png
+    ├── electrolyte_ncore_sweep.png
+    └── electrolyte_parallel_efficiency.png
+```
+
 ## Electrode structure generation (scaffold)
 
 Inputs accepted by the scaffold:
 
 - Pristine structure path or Materials Project ID (`mp-...`)
+- MPID cell mode toggle: `--conventional-unit-cell` / `--no-conventional-unit-cell` (default: conventional)
 - Target ion (default `Li`, extensible to `Na`, etc.)
 - Supercell size (default `[3, 3, 3]`)
 - Output directory (default `./electrode_structures/`)

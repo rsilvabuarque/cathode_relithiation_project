@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pristine-structure", type=Path, default=None)
     parser.add_argument("--mpid", type=str, default=None)
+    parser.add_argument(
+        "--conventional-unit-cell",
+        "--conventional_unit_cell",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When loading from --mpid, request conventional unit cell from Materials Project (default: enabled).",
+    )
     parser.add_argument("--target-ion", type=str, default="Li")
     parser.add_argument("--supercell", type=int, nargs=3, default=(3, 3, 3))
     parser.add_argument(
@@ -178,6 +185,7 @@ def config_from_args(args: argparse.Namespace) -> ElectrodeGenerationConfig:
     config = default_electrode_generation_config()
     config.source.pristine_structure_path = args.pristine_structure
     config.source.mpid = args.mpid
+    config.source.conventional_unit_cell = bool(args.conventional_unit_cell)
     config.source.target_ion = args.target_ion
     config.source.supercell = tuple(args.supercell)
 
@@ -397,6 +405,7 @@ class ElectrodeStructureGenerationPipeline:
                     if self.config.source.pristine_structure_path is not None
                     else None
                 ),
+                "conventional_unit_cell": bool(self.config.source.conventional_unit_cell),
                 "target_ion": self.config.source.target_ion,
                 "supercell": list(self.config.source.supercell),
             },
@@ -468,7 +477,10 @@ class ElectrodeStructureGenerationPipeline:
                     "MP_API_KEY is required to fetch structures from Materials Project"
                 )
             with MPRester(api_key) as rester:
-                structure = rester.get_structure_by_material_id(mpid)
+                structure = rester.get_structure_by_material_id(
+                    mpid,
+                    conventional_unit_cell=bool(self.config.source.conventional_unit_cell),
+                )
 
         structure.make_supercell(self.config.source.supercell)
         return structure

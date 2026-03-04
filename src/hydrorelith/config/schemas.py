@@ -10,6 +10,7 @@ class StructureSourceConfig:
     mpid: str | None = None
     target_ion: str = "Li"
     supercell: tuple[int, int, int] = (3, 3, 3)
+    conventional_unit_cell: bool = True
 
 
 @dataclass(slots=True)
