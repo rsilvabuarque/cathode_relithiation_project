@@ -20,6 +20,7 @@
 
 - `hydrorelith.config`: schema and default policies.
 - `hydrorelith.pipelines`: phase orchestration.
+  - includes structure generation and SCF parallelization benchmarking utilities.
 - Future:
   - `hydrorelith.dft`
   - `hydrorelith.training`

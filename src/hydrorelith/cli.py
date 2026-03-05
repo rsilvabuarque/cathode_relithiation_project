@@ -18,6 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
         "electrolyte-generate",
         help="Scaffold command for electrolyte structure generation workflow.",
     )
+    subparsers.add_parser(
+        "scf-parallel-benchmark",
+        help="Scaffold command for SCF parallelization benchmarking workflow.",
+    )
     return parser
 
 
@@ -32,6 +36,10 @@ def main() -> None:
     if args.command == "electrolyte-generate":
         raise NotImplementedError(
             "Use `hrw-electrolyte-generate` for the dedicated scaffold command."
+        )
+    if args.command == "scf-parallel-benchmark":
+        raise NotImplementedError(
+            "Use `hrw-scf-parallel-benchmark` for the dedicated scaffold command."
         )
 
     parser.print_help()

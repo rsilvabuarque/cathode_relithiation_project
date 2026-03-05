@@ -36,6 +36,7 @@ dev = [
 hrw = "hydrorelith.cli:main"
 hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:main"
 hrw-electrolyte-generate = "hydrorelith.pipelines.electrolyte_structure_generation:main"
+hrw-scf-parallel-benchmark = "hydrorelith.pipelines.scf_parallelization_benchmark:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
