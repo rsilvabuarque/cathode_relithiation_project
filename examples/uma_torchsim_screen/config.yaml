@@ -1,0 +1,17 @@
+output_dir: runs/uma_torchsim
+phase: both
+stage: all
+model_name: uma-s-1p1
+device: cuda
+ensemble: nvt
+timestep_ps: 0.001
+dump_every_steps: 2
+retherm_steps_electrode: 2000
+retherm_steps_electrolyte: 5000
+prod_steps: 15000
+replicas: 3
+base_seed: 0
+compute_stress: false
+o_h_covalent_cutoff_A: 1.25
+li_o_cutoff_A: 2.6
+vacancy_site_match_cutoff_A: 1.0
