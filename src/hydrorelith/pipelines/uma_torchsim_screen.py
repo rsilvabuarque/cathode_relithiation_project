@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from ase.io import read as ase_read
+from tqdm.auto import tqdm
 
 from hydrorelith.analysis.uma_torchsim_descriptors import (
     O_HYDROXIDE,
@@ -148,21 +150,29 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
     phase_root = config.output_dir / "uma_torchsim_screen" / phase
     plot_root = config.output_dir / "uma_torchsim_screen" / "plots"
     rows: list[dict] = []
+    cond_dirs = sorted([p for p in phase_root.iterdir() if p.is_dir()] if phase_root.exists() else [])
+    tqdm.write(f"[analyze:{phase}] discovered {len(cond_dirs)} condition directories under {phase_root}")
 
     pristine = None
     if phase == "electrode" and config.electrode_reference_pristine is not None:
         pristine = ase_read(config.electrode_reference_pristine)
 
-    for cond_dir in sorted([p for p in phase_root.iterdir() if p.is_dir()] if phase_root.exists() else []):
+    cond_bar = tqdm(cond_dirs, desc=f"analyze {phase}", unit="condition")
+    for cond_dir in cond_bar:
+        t_cond = time.perf_counter()
         rep_dirs = sorted([p for p in cond_dir.iterdir() if p.is_dir() and p.name.startswith("replica_")])
+        cond_bar.set_postfix_str(f"replicas={len(rep_dirs)}")
         d_vals, cn_oh_vals, res_oh_vals, vac_vals = [], [], [], []
         li_msd_1ps_vals = []
         cond_meta: dict | None = None
 
-        for rep_dir in rep_dirs:
+        rep_bar = tqdm(rep_dirs, desc=f"{cond_dir.name}", unit="replica", leave=False)
+        for rep_dir in rep_bar:
             prod_h5 = rep_dir / "prod.h5md"
             if not prod_h5.exists():
+                rep_bar.set_postfix_str("missing prod.h5md")
                 continue
+            t_rep = time.perf_counter()
             data = _read_h5md(prod_h5)
             if cond_meta is None:
                 cond_meta = _parse_manifest_row_from_metadata(rep_dir)
@@ -172,6 +182,7 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
             z = data["atomic_numbers"]
             pbc = data.get("pbc", np.array([1, 1, 1], dtype=bool))
             times = data["time_ps"]
+            rep_bar.set_postfix_str(f"frames={len(times)}")
 
             stride = config.analysis_frame_stride
             if stride is None:
@@ -325,8 +336,11 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
                 title=f"{phase} {cond_dir.name} {rep_dir.name}",
             )
             (rep_dir / "descriptors.json").write_text(json.dumps(desc, indent=2), encoding="utf-8")
+            rep_bar.set_postfix_str(f"done {time.perf_counter() - t_rep:.1f}s")
+        rep_bar.close()
 
         if cond_meta is None:
+            tqdm.write(f"[analyze:{phase}] skipping {cond_dir.name}: no readable prod.h5md files")
             continue
         d_mean, d_std = _mean_std(d_vals)
         cond_row = {
@@ -348,6 +362,13 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
             if "lithiation_fraction" in cond_meta:
                 cond_row["lithiation_fraction"] = float(cond_meta["lithiation_fraction"])
         rows.append(cond_row)
+        tqdm.write(
+            f"[analyze:{phase}] condition {cond_dir.name} complete in "
+            f"{time.perf_counter() - t_cond:.1f}s"
+        )
+
+    cond_bar.close()
+    tqdm.write(f"[analyze:{phase}] completed {len(rows)} summarized condition rows")
 
     return rows
 
@@ -416,6 +437,10 @@ def _run_regression_and_plots(config: ScreenConfig, electrode_rows: list[dict], 
     plot_root = config.output_dir / "uma_torchsim_screen" / "plots"
 
     merged_rows = _cartesian_merge_rows(electrode_rows, electrolyte_rows)
+    tqdm.write(
+        "[plots] regression input rows: "
+        f"electrode={len(electrode_rows)}, electrolyte={len(electrolyte_rows)}, merged={len(merged_rows)}"
+    )
     rates = load_experimental_rates(config.experimental_rates_csv) if config.experimental_rates_csv else None
 
     rates_by_key = {}
@@ -429,6 +454,7 @@ def _run_regression_and_plots(config: ScreenConfig, electrode_rows: list[dict], 
 
     _write_rows_csv(merged_rows, merged_dir / "features.csv")
     fit_simple_models(merged_rows, merged_dir)
+    tqdm.write(f"[plots] wrote merged tables to {merged_dir}")
 
     fig, ax = plt.subplots(figsize=(6, 4))
     scores = [float(r["predicted_score"]) for r in merged_rows]
@@ -454,6 +480,7 @@ def _run_regression_and_plots(config: ScreenConfig, electrode_rows: list[dict], 
         plot_root / "heatmap_tp_by_x_and_conc.png",
         plot_root / "best_conditions_table.csv",
     )
+    tqdm.write(f"[plots] wrote plot outputs to {plot_root}")
 
 
 def main() -> None:
@@ -483,24 +510,31 @@ def main() -> None:
     phases = _phase_list(config)
 
     if _stage_enabled(config, "md"):
+        tqdm.write("[stage] starting md")
         for phase in phases:
+            tqdm.write(f"[stage] md phase={phase}")
             run_one_phase(phase, config)
 
     electrode_rows: list[dict] = []
     electrolyte_rows: list[dict] = []
     if _stage_enabled(config, "analyze"):
+        tqdm.write("[stage] starting analyze")
         if "electrode" in phases:
             electrode_rows = _analyze_phase(config, "electrode")
             _write_rows_csv(electrode_rows, run_root / "electrode_descriptors.csv")
+            tqdm.write(f"[stage] wrote electrode descriptors: {run_root / 'electrode_descriptors.csv'}")
         if "electrolyte" in phases:
             electrolyte_rows = _analyze_phase(config, "electrolyte")
             _write_rows_csv(electrolyte_rows, run_root / "electrolyte_descriptors.csv")
+            tqdm.write(f"[stage] wrote electrolyte descriptors: {run_root / 'electrolyte_descriptors.csv'}")
 
     if _stage_enabled(config, "export-2pt"):
+        tqdm.write("[stage] starting export-2pt")
         for phase in phases:
             _run_export_2pt(config, phase)
 
     if _stage_enabled(config, "regress"):
+        tqdm.write("[stage] starting regress")
         if not electrode_rows and (run_root / "electrode_descriptors.csv").exists():
             with (run_root / "electrode_descriptors.csv").open("r", newline="", encoding="utf-8") as handle:
                 electrode_rows = list(csv.DictReader(handle))
@@ -510,6 +544,7 @@ def main() -> None:
         _run_regression_and_plots(config, electrode_rows, electrolyte_rows)
 
     if _stage_enabled(config, "plots") and not _stage_enabled(config, "regress"):
+        tqdm.write("[stage] starting plots")
         if not electrode_rows and (run_root / "electrode_descriptors.csv").exists():
             with (run_root / "electrode_descriptors.csv").open("r", newline="", encoding="utf-8") as handle:
                 electrode_rows = list(csv.DictReader(handle))
