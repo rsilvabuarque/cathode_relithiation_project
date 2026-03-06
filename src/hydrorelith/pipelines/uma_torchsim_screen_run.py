@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 from ase import Atoms
 from ase.io import read as ase_read
+from tqdm.auto import tqdm
 
 from hydrorelith.io.structure_manifest import StructureItem, discover_structures, load_manifest
 from hydrorelith.pipelines.uma_torchsim_screen_config import ScreenConfig, default_tp_grid
@@ -15,6 +17,38 @@ from hydrorelith.pipelines.uma_torchsim_screen_models import load_fairchem_model
 
 KB = 8.617333262e-5  # eV/K
 AMU_TO_EV_PS2_PER_A2 = 103.642691
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+class _EmaRateTracker:
+    def __init__(self, alpha: float = 0.30) -> None:
+        self.alpha = float(alpha)
+        self.steps_per_sec: float | None = None
+
+    def update(self, nsteps: int, elapsed_s: float) -> None:
+        if nsteps <= 0 or elapsed_s <= 0:
+            return
+        sample = float(nsteps) / float(elapsed_s)
+        if self.steps_per_sec is None:
+            self.steps_per_sec = sample
+        else:
+            self.steps_per_sec = self.alpha * sample + (1.0 - self.alpha) * self.steps_per_sec
+
+    def eta(self, remaining_steps: int) -> float | None:
+        if self.steps_per_sec is None or self.steps_per_sec <= 0:
+            return None
+        return float(remaining_steps) / self.steps_per_sec
 
 
 def _resolve_device(device: str) -> str:
@@ -138,6 +172,7 @@ def _run_lightweight_md(
     timestep_ps: float,
     seed: int,
     target_temp_K: float,
+    progress_callback: callable | None = None,
 ) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     pos = atoms.get_positions().astype(float)
@@ -180,6 +215,9 @@ def _run_lightweight_md(
             temp[frame_idx] = _temperature_from_ke(ke[frame_idx], natoms)
             vol[frame_idx] = abs(np.linalg.det(cell))
             frame_idx += 1
+
+        if progress_callback is not None:
+            progress_callback(step + 1)
 
     return {
         "atomic_numbers": z,
@@ -291,6 +329,18 @@ def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: flo
 def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str) -> None:
     out_root = config.output_dir / "uma_torchsim_screen" / phase
     device = _resolve_device(config.device)
+    retherm_steps = config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
+
+    # Two runs per replica: rethermalization and production.
+    run_plan_steps: list[int] = []
+    for _item in items:
+        for _replica in range(config.replicas):
+            run_plan_steps.extend([retherm_steps + 1, config.prod_steps + 1])
+
+    ema_tracker = _EmaRateTracker(alpha=0.30)
+    completed_steps = 0
+    global_bar = tqdm(total=len(run_plan_steps), desc=f"{phase} MD batches", unit="run")
+
     for item_idx, item in enumerate(items):
         for replica in range(config.replicas):
             seed = config.base_seed + item_idx * 1000 + replica
@@ -301,10 +351,34 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
             atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
             temp_k = float(item.temperature_C) + 273.15
 
-            retherm_steps = (
-                config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
-            )
             for run_name, nsteps in (("retherm", retherm_steps), ("prod", config.prod_steps)):
+                nsteps_total = nsteps + 1
+                remaining_all_steps = sum(run_plan_steps) - completed_steps
+                eta_total = ema_tracker.eta(remaining_all_steps)
+                if eta_total is None:
+                    global_bar.set_postfix_str("ETA total: collecting performance...")
+                else:
+                    global_bar.set_postfix_str(f"ETA total: {_format_duration(eta_total)}")
+
+                run_desc = f"{item.condition_id} | rep {replica:03d} | {run_name}"
+                run_bar = tqdm(total=nsteps_total, desc=run_desc, unit="step", leave=False)
+                current_est = ema_tracker.eta(nsteps_total)
+                if current_est is not None:
+                    run_bar.set_postfix_str(f"ETA ~ {_format_duration(current_est)}")
+
+                last_progress = 0
+
+                def _on_progress(done_steps: int) -> None:
+                    nonlocal last_progress
+                    increment = max(0, int(done_steps) - int(last_progress))
+                    if increment > 0:
+                        run_bar.update(increment)
+                        last_progress += increment
+                    eta_current = ema_tracker.eta(max(0, nsteps_total - int(done_steps)))
+                    if eta_current is not None:
+                        run_bar.set_postfix_str(f"ETA ~ {_format_duration(eta_current)}")
+
+                t0 = time.perf_counter()
                 traj = _try_torchsim_md(
                     atoms=atoms,
                     nsteps=nsteps,
@@ -324,7 +398,16 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         timestep_ps=config.timestep_ps,
                         seed=seed,
                         target_temp_K=temp_k,
+                        progress_callback=_on_progress,
                     )
+                else:
+                    # TorchSim integration is blocking; complete the per-run bar at the end.
+                    _on_progress(nsteps_total)
+
+                elapsed_s = time.perf_counter() - t0
+                ema_tracker.update(nsteps_total, elapsed_s)
+                run_bar.set_postfix_str(f"done in {_format_duration(elapsed_s)}")
+                run_bar.close()
 
                 _write_h5md_like(
                     rep_dir / f"{run_name}.h5md",
@@ -345,6 +428,9 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 )
                 if run_name == "prod":
                     _write_thermo_csv(rep_dir / "prod_thermo.csv", traj, float(item.pressure_MPa))
+
+                completed_steps += nsteps_total
+                global_bar.update(1)
 
             metadata = {
                 "condition_id": item.condition_id,
@@ -367,6 +453,9 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 "dump_every_steps": config.dump_every_steps,
             }
             (rep_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    global_bar.set_postfix_str("completed")
+    global_bar.close()
 
 
 def run_one_phase(phase: str, config: ScreenConfig) -> None:
