@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--md-only", action="store_true")
     parser.add_argument("--model-name", type=str, default="uma-s-1p1")
-    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="cuda")
     parser.add_argument("--ensemble", choices=["nvt", "npt"], default="nvt")
     parser.add_argument("--timestep-ps", type=float, default=0.001)
     parser.add_argument("--dump-every-steps", type=int, default=2)
@@ -365,6 +365,46 @@ def _write_rows_csv(rows: list[dict], out_csv: Path) -> None:
 
 
 def _cartesian_merge_rows(electrode_rows: list[dict], electrolyte_rows: list[dict]) -> list[dict]:
+    if not electrode_rows and electrolyte_rows:
+        merged = []
+        for lr in electrolyte_rows:
+            row = {
+                **{f"electrolyte_{k}": v for k, v in lr.items()},
+                "condition_id": lr.get("condition_id"),
+                "temperature_C": lr.get("temperature_C"),
+                "pressure_MPa": lr.get("pressure_MPa"),
+                "D_li_A2_per_ps": lr.get("D_li_A2_per_ps", 0.0),
+                "residence_proxy_oh": lr.get("residence_proxy_oh", 0.0),
+                "cn_hydroxide_mean": lr.get("cn_hydroxide_mean", 0.0),
+                "liOH_M": lr.get("liOH_M", 0.0),
+                "vacancy_accessibility_mean": 0.0,
+                "electrode_li_msd_1ps": 0.0,
+                "lithiation_bin": "electrolyte-only",
+                "liOH_bin": str(lr.get("liOH_M", "all")),
+            }
+            merged.append(row)
+        return merged
+
+    if electrode_rows and not electrolyte_rows:
+        merged = []
+        for er in electrode_rows:
+            row = {
+                **{f"electrode_{k}": v for k, v in er.items()},
+                "condition_id": er.get("condition_id"),
+                "temperature_C": er.get("temperature_C"),
+                "pressure_MPa": er.get("pressure_MPa"),
+                "D_li_A2_per_ps": 0.0,
+                "residence_proxy_oh": 0.0,
+                "cn_hydroxide_mean": 0.0,
+                "liOH_M": 0.0,
+                "vacancy_accessibility_mean": er.get("vacancy_accessibility_mean", 0.0),
+                "electrode_li_msd_1ps": er.get("electrode_li_msd_1ps", 0.0),
+                "lithiation_bin": str(er.get("lithiation_fraction", "all")),
+                "liOH_bin": "electrode-only",
+            }
+            merged.append(row)
+        return merged
+
     merged = []
     for er in electrode_rows:
         for lr in electrolyte_rows:
