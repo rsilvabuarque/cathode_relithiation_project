@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +21,64 @@ from hydrorelith.pipelines.uma_torchsim_screen_models import load_fairchem_model
 
 KB = 8.617333262e-5  # eV/K
 AMU_TO_EV_PS2_PER_A2 = 103.642691
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _start_heartbeat(
+    status_path: Path,
+    *,
+    phase: str,
+    condition_id: str,
+    replica: int,
+    run_name: str,
+    nsteps_total: int,
+    backend_hint: str,
+    update_every_s: float = 10.0,
+) -> tuple[threading.Event, threading.Thread, float]:
+    started_ts = time.time()
+    stop_event = threading.Event()
+
+    def _loop() -> None:
+        while not stop_event.wait(update_every_s):
+            elapsed = time.time() - started_ts
+            _write_json(
+                status_path,
+                {
+                    "status": "running",
+                    "phase": phase,
+                    "condition_id": condition_id,
+                    "replica": replica,
+                    "run_name": run_name,
+                    "backend_hint": backend_hint,
+                    "nsteps_total": int(nsteps_total),
+                    "elapsed_s": float(elapsed),
+                    "elapsed_human": _format_duration(elapsed),
+                    "note": "TorchSim integration is running. Long first-run warmup is expected.",
+                },
+            )
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    _write_json(
+        status_path,
+        {
+            "status": "running",
+            "phase": phase,
+            "condition_id": condition_id,
+            "replica": replica,
+            "run_name": run_name,
+            "backend_hint": backend_hint,
+            "nsteps_total": int(nsteps_total),
+            "elapsed_s": 0.0,
+            "elapsed_human": "0s",
+            "note": "Run started.",
+        },
+    )
+    return stop_event, thread, started_ts
 
 
 def _format_duration(seconds: float) -> str:
@@ -314,7 +373,7 @@ def _try_torchsim_md(
         steps = np.arange(positions.shape[0], dtype=int) * save_every
         ke = 0.5 * np.sum(masses[None, :, None] * velocities**2, axis=(1, 2)) / AMU_TO_EV_PS2_PER_A2
 
-        return {
+        result = {
             "atomic_numbers": atomic_numbers,
             "masses": masses,
             "positions": positions,
@@ -331,6 +390,8 @@ def _try_torchsim_md(
             "atom_potential_energy": None,
             "backend": "torchsim",
         }
+        Path(tmp_path).unlink(missing_ok=True)
+        return result
     except Exception:
         return None
 
@@ -440,6 +501,19 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         run_bar.set_postfix_str(f"ETA ~ {_format_duration(eta_current)}")
 
                 t0 = time.perf_counter()
+                status_path = rep_dir / f"{run_name}_status.json"
+                stop_event, heartbeat_thread, started_ts = _start_heartbeat(
+                    status_path,
+                    phase=phase,
+                    condition_id=item.condition_id,
+                    replica=replica,
+                    run_name=run_name,
+                    nsteps_total=nsteps_total,
+                    backend_hint="torchsim_or_fallback",
+                )
+                tqdm.write(
+                    f"[md] started {run_desc}; live status: {status_path}"
+                )
                 traj = _try_torchsim_md(
                     atoms=atoms,
                     nsteps=nsteps,
@@ -466,10 +540,29 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     # TorchSim integration is blocking; complete the per-run bar at the end.
                     _on_progress(nsteps_total)
 
+                stop_event.set()
+                heartbeat_thread.join(timeout=2.0)
+
                 elapsed_s = time.perf_counter() - t0
                 ema_tracker.update(nsteps_total, elapsed_s)
                 run_bar.set_postfix_str(f"done in {_format_duration(elapsed_s)}")
                 run_bar.close()
+                _write_json(
+                    status_path,
+                    {
+                        "status": "completed",
+                        "phase": phase,
+                        "condition_id": item.condition_id,
+                        "replica": replica,
+                        "run_name": run_name,
+                        "backend": traj.get("backend", "unknown"),
+                        "nsteps_total": int(nsteps_total),
+                        "elapsed_s": float(elapsed_s),
+                        "elapsed_human": _format_duration(elapsed_s),
+                        "started_unix": float(started_ts),
+                        "completed_unix": float(time.time()),
+                    },
+                )
 
                 _write_h5md_like(
                     rep_dir / f"{run_name}.h5md",
