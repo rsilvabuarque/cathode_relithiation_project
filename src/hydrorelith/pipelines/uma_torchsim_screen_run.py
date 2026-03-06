@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import csv
 import json
-import tempfile
-import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from ase import Atoms
-from ase.data import chemical_symbols
 from ase.io import read as ase_read
-from ase.io import write as ase_write
 from tqdm.auto import tqdm
 
 from hydrorelith.io.structure_manifest import StructureItem, discover_structures, load_manifest
@@ -21,64 +17,6 @@ from hydrorelith.pipelines.uma_torchsim_screen_models import load_fairchem_model
 
 KB = 8.617333262e-5  # eV/K
 AMU_TO_EV_PS2_PER_A2 = 103.642691
-
-
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _start_heartbeat(
-    status_path: Path,
-    *,
-    phase: str,
-    condition_id: str,
-    replica: int,
-    run_name: str,
-    nsteps_total: int,
-    backend_hint: str,
-    update_every_s: float = 10.0,
-) -> tuple[threading.Event, threading.Thread, float]:
-    started_ts = time.time()
-    stop_event = threading.Event()
-
-    def _loop() -> None:
-        while not stop_event.wait(update_every_s):
-            elapsed = time.time() - started_ts
-            _write_json(
-                status_path,
-                {
-                    "status": "running",
-                    "phase": phase,
-                    "condition_id": condition_id,
-                    "replica": replica,
-                    "run_name": run_name,
-                    "backend_hint": backend_hint,
-                    "nsteps_total": int(nsteps_total),
-                    "elapsed_s": float(elapsed),
-                    "elapsed_human": _format_duration(elapsed),
-                    "note": "TorchSim integration is running. Long first-run warmup is expected.",
-                },
-            )
-
-    thread = threading.Thread(target=_loop, daemon=True)
-    thread.start()
-    _write_json(
-        status_path,
-        {
-            "status": "running",
-            "phase": phase,
-            "condition_id": condition_id,
-            "replica": replica,
-            "run_name": run_name,
-            "backend_hint": backend_hint,
-            "nsteps_total": int(nsteps_total),
-            "elapsed_s": 0.0,
-            "elapsed_human": "0s",
-            "note": "Run started.",
-        },
-    )
-    return stop_event, thread, started_ts
 
 
 def _format_duration(seconds: float) -> str:
@@ -114,23 +52,14 @@ class _EmaRateTracker:
 
 
 def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
     try:
         import torch
-    except Exception as exc:
-        if device == "cuda":
-            raise RuntimeError(
-                "--device cuda requested but torch is unavailable in this environment."
-            ) from exc
-        return "cpu"
 
-    if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "--device cuda requested but no CUDA GPU is visible. "
-            "Use --device cpu explicitly if this is intentional."
-        )
-    return device
+    except Exception:
+        return "cpu"
 
 
 def _read_tp_grid(path: Path) -> list[tuple[float, float]]:
@@ -305,7 +234,6 @@ def _run_lightweight_md(
         "temperature": temp,
         "volume": vol,
         "atom_potential_energy": None,
-        "backend": "lightweight_fallback",
     }
 
 
@@ -319,104 +247,54 @@ def _try_torchsim_md(
     device: str,
     compute_stress: bool,
     seed: int,
-    temperature_K: float,
 ) -> dict[str, np.ndarray] | None:
     # TorchSim APIs are evolving. If API mismatch occurs, fall back to lightweight mode.
     try:
         import torch_sim as ts
-        from torch_sim.trajectory import TrajectoryReporter
-        import h5py
+        from torch_sim.io import TrajectoryReporter
 
         model = load_fairchem_model(model_name, task_name, device, compute_stress)
-        # Use TorchSim's native reporter, then convert to the internal h5md-like schema.
-        with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
-            tmp_path = tmp.name
-
         rep = TrajectoryReporter(
-            tmp_path,
             state_frequency=save_every,
-            prop_calculators={
-                save_every: {
-                    "potential_energy": lambda s, model=None: s.energy,
-                    "volume": lambda s, model=None: s.volume,
-                    "temperature": lambda s, model=None: s.calc_temperature(),
-                }
+            state_kwargs={
+                "save_velocities": True,
+                "save_forces": True,
+                "variable_cell": False,
             },
-            state_kwargs={"save_velocities": True, "save_forces": True, "variable_cell": False},
         )
-        ts.integrate(
-            system=atoms,
+        out = ts.integrate(
+            atoms=atoms,
             model=model,
-            integrator=ts.Integrator.nvt_langevin,
             n_steps=nsteps,
-            temperature=float(temperature_K),
-            timestep=timestep_ps,
-            trajectory_reporter=rep,
-            pbar=False,
+            dt=timestep_ps,
+            seed=seed,
+            integrator=ts.Integrator.nvt_langevin,
+            reporters=[rep],
         )
-        rep.close()
+        traj = rep.to_dict() if hasattr(rep, "to_dict") else out
 
-        with h5py.File(tmp_path, "r") as h5:
-            data = h5["data"]
-            positions = np.array(data["positions"], dtype=float)
-            velocities = np.array(data["velocities"], dtype=float)
-            forces = np.array(data["forces"], dtype=float)
-            cell = np.array(data["cell"], dtype=float)
-            pbc = np.array(data["pbc"], dtype=bool)
-            atomic_numbers = np.array(data["atomic_numbers"], dtype=int).reshape(-1)
-            masses = np.array(data["masses"], dtype=float).reshape(-1)
-            potential_energy = np.array(data.get("potential_energy", np.zeros((positions.shape[0], 1))), dtype=float).reshape(-1)
-            temperature = np.array(data.get("temperature", np.zeros((positions.shape[0], 1))), dtype=float).reshape(-1)
-            volume = np.array(data.get("volume", np.zeros((positions.shape[0], 1))), dtype=float).reshape(-1)
-
-        time_ps = np.arange(positions.shape[0], dtype=float) * save_every * timestep_ps
-        steps = np.arange(positions.shape[0], dtype=int) * save_every
-        ke = 0.5 * np.sum(masses[None, :, None] * velocities**2, axis=(1, 2)) / AMU_TO_EV_PS2_PER_A2
-
-        result = {
-            "atomic_numbers": atomic_numbers,
-            "masses": masses,
-            "positions": positions,
-            "velocities": velocities,
-            "forces": forces,
-            "cell": cell,
-            "pbc": pbc,
-            "step": steps,
-            "time_ps": time_ps,
-            "potential_energy": potential_energy,
-            "kinetic_energy": ke,
-            "temperature": temperature,
-            "volume": volume,
-            "atom_potential_energy": None,
-            "backend": "torchsim",
+        return {
+            "atomic_numbers": np.array(traj["atomic_numbers"], dtype=int),
+            "masses": np.array(traj["masses"], dtype=float),
+            "positions": np.array(traj["positions"], dtype=float),
+            "velocities": np.array(traj["velocities"], dtype=float),
+            "forces": np.array(traj.get("forces", 0.0), dtype=float),
+            "cell": np.array(traj["cell"], dtype=float),
+            "pbc": np.array(traj["pbc"], dtype=bool),
+            "step": np.array(traj["step"], dtype=int),
+            "time_ps": np.array(traj["time_ps"], dtype=float),
+            "potential_energy": np.array(traj.get("potential_energy", 0.0), dtype=float),
+            "kinetic_energy": np.array(traj.get("kinetic_energy", 0.0), dtype=float),
+            "temperature": np.array(traj.get("temperature", 0.0), dtype=float),
+            "volume": np.array(traj.get("volume", 0.0), dtype=float),
+            "atom_potential_energy": (
+                np.array(traj.get("atom_energy"), dtype=float)
+                if traj.get("atom_energy") is not None
+                else None
+            ),
         }
-        Path(tmp_path).unlink(missing_ok=True)
-        return result
     except Exception:
         return None
-
-
-def _write_extxyz_trajectory(path: Path, traj: dict[str, np.ndarray]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    z = np.asarray(traj["atomic_numbers"], dtype=int)
-    symbols = [chemical_symbols[int(zi)] for zi in z]
-    pbc = np.asarray(traj["pbc"], dtype=bool)
-    positions = np.asarray(traj["positions"], dtype=float)
-    velocities = np.asarray(traj["velocities"], dtype=float)
-    forces = np.asarray(traj["forces"], dtype=float)
-    cells = np.asarray(traj["cell"], dtype=float)
-    steps = np.asarray(traj["step"], dtype=int)
-    times = np.asarray(traj["time_ps"], dtype=float)
-
-    wrote_any = False
-    for i in range(positions.shape[0]):
-        atoms = Atoms(symbols=symbols, positions=positions[i], cell=cells[min(i, cells.shape[0] - 1)], pbc=pbc)
-        atoms.arrays["velocities_Aps"] = velocities[i]
-        atoms.arrays["forces_eVA"] = forces[i]
-        atoms.info["step"] = int(steps[i])
-        atoms.info["time_ps"] = float(times[i])
-        ase_write(path, atoms, format="extxyz", append=wrote_any)
-        wrote_any = True
 
 
 def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: float) -> None:
@@ -501,19 +379,6 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         run_bar.set_postfix_str(f"ETA ~ {_format_duration(eta_current)}")
 
                 t0 = time.perf_counter()
-                status_path = rep_dir / f"{run_name}_status.json"
-                stop_event, heartbeat_thread, started_ts = _start_heartbeat(
-                    status_path,
-                    phase=phase,
-                    condition_id=item.condition_id,
-                    replica=replica,
-                    run_name=run_name,
-                    nsteps_total=nsteps_total,
-                    backend_hint="torchsim_or_fallback",
-                )
-                tqdm.write(
-                    f"[md] started {run_desc}; live status: {status_path}"
-                )
                 traj = _try_torchsim_md(
                     atoms=atoms,
                     nsteps=nsteps,
@@ -524,7 +389,6 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     device=device,
                     compute_stress=config.compute_stress,
                     seed=seed,
-                    temperature_K=temp_k,
                 )
                 if traj is None:
                     traj = _run_lightweight_md(
@@ -540,29 +404,10 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     # TorchSim integration is blocking; complete the per-run bar at the end.
                     _on_progress(nsteps_total)
 
-                stop_event.set()
-                heartbeat_thread.join(timeout=2.0)
-
                 elapsed_s = time.perf_counter() - t0
                 ema_tracker.update(nsteps_total, elapsed_s)
                 run_bar.set_postfix_str(f"done in {_format_duration(elapsed_s)}")
                 run_bar.close()
-                _write_json(
-                    status_path,
-                    {
-                        "status": "completed",
-                        "phase": phase,
-                        "condition_id": item.condition_id,
-                        "replica": replica,
-                        "run_name": run_name,
-                        "backend": traj.get("backend", "unknown"),
-                        "nsteps_total": int(nsteps_total),
-                        "elapsed_s": float(elapsed_s),
-                        "elapsed_human": _format_duration(elapsed_s),
-                        "started_unix": float(started_ts),
-                        "completed_unix": float(time.time()),
-                    },
-                )
 
                 _write_h5md_like(
                     rep_dir / f"{run_name}.h5md",
@@ -581,7 +426,6 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     vol=traj["volume"],
                     atom_pe=traj["atom_potential_energy"],
                 )
-                _write_extxyz_trajectory(rep_dir / f"{run_name}.extxyz", traj)
                 if run_name == "prod":
                     _write_thermo_csv(rep_dir / "prod_thermo.csv", traj, float(item.pressure_MPa))
 
@@ -607,7 +451,6 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 "ensemble": config.ensemble,
                 "timestep_ps": config.timestep_ps,
                 "dump_every_steps": config.dump_every_steps,
-                "md_backend": traj.get("backend", "unknown"),
             }
             (rep_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 

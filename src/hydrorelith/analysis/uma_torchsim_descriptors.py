@@ -121,10 +121,16 @@ def compute_rdf(pos_A_series, Z, cell_A_series, pbc, pairs, r_max_A, dr_A) -> di
         b_idx = selector.get(b_name, np.array([], dtype=int))
         hist = np.zeros(len(r), dtype=float)
         n_count = 0
+        shell_vol = (4.0 / 3.0) * np.pi * (bins[1:] ** 3 - bins[:-1] ** 3)
+        density_terms: list[float] = []
         for frame in range(positions.shape[0]):
             if a_idx.size == 0 or b_idx.size == 0:
                 continue
             cell = cells[frame]
+            vol = abs(np.linalg.det(cell))
+            if vol <= 0:
+                continue
+            density_terms.append(float(b_idx.size) / float(vol))
             for ai in a_idx:
                 delta = positions[frame, b_idx] - positions[frame, ai]
                 delta = _min_image_delta(delta, cell, pbc_arr)
@@ -132,8 +138,12 @@ def compute_rdf(pos_A_series, Z, cell_A_series, pbc, pairs, r_max_A, dr_A) -> di
                 h, _ = np.histogram(dist, bins=bins)
                 hist += h
                 n_count += 1
-        if n_count > 0:
-            hist /= float(n_count)
+        if n_count > 0 and density_terms:
+            rho_b = float(np.mean(density_terms))
+            denom = float(n_count) * rho_b * shell_vol
+            # Avoid division-by-zero near r=0 for degenerate bins.
+            denom = np.where(denom > 1e-16, denom, 1.0)
+            hist = hist / denom
         out[pair_name] = {"r_A": r.tolist(), "g_r": hist.tolist()}
     return out
 

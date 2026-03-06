@@ -51,7 +51,7 @@ def default_config() -> ScreenConfig:
         phase="both",
         stages=("all",),
         model_name="uma-s-1p1",
-        device="cuda",
+        device="auto",
         ensemble="nvt",
         timestep_ps=0.001,
         dump_every_steps=2,
