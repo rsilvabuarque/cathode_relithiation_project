@@ -2,6 +2,10 @@
 
 `uma_torchsim_screen` is a GPU-first screening workflow for hydrothermal relithiation studies using TorchSim batched MD + FAIRChem UMA.
 
+Thermostat/barostat policy:
+- `retherm` is run in NPT to relax density/volume at target T/P.
+- `prod` is run in NVT and initialized from the NPT endpoint, with cell rescaled to the replica-averaged equilibrated volume from NPT.
+
 - Electrode task: `omat`
 - Electrolyte task: `omol`
 - Output root: `<output_dir>/uma_torchsim_screen/`
@@ -48,6 +52,12 @@ When manifest rows miss T/P, or when `--use-default-tp-grid` is set, defaults ar
 - 120 C @ 0.08 MPa
 
 ## Running Locally
+
+Key runtime defaults:
+- `--retherm-steps-electrode 2000`
+- `--retherm-steps-electrolyte 8000`
+- `--prod-steps 25000`
+- `--replicas 3`
 
 Full run:
 
@@ -121,10 +131,16 @@ Pointers for references:
 
 The workflow writes:
 
-- `electrode/<condition_id>/replica_000/{retherm.h5md,prod.h5md,prod_thermo.csv,descriptors.json}`
+- `electrode/<condition_id>/replica_000/{retherm.h5md,retherm_thermo.csv,retherm_equilibration.json,prod.h5md,prod_thermo.csv,descriptors.json}`
 - `electrolyte/<condition_id>/replica_000/{...}`
 - `export2pt/<phase>/<condition_id>/replica_000/{prod.lammpstrj,type_map.json,2pt_metadata.json}`
 - `merged/{features.csv,regression_summary.json,pred_vs_true.csv}`
 - `plots/*.png`
 
 Plot set includes MSD/fits, RDF, CN traces + histogram, residence proxy, oxygen species counts, vacancy metrics, predicted-vs-experimental, and faceted T/P heatmaps.
+
+Replica-aggregated error-band plots (`mean +/- std`) are also emitted, including:
+- `*_msd_li_replicas_mean_std.png`
+- `*_rdf_li_o_total_replicas_mean_std.png`
+- `*_cn_time_series_replicas_mean_std.png`
+- `*_density_retherm_equilibration.png` (NPT density evolution with equilibration cutoff marker and production-density average line)

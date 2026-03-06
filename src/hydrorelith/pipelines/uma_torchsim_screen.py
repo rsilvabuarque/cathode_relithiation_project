@@ -27,10 +27,14 @@ from hydrorelith.analysis.uma_torchsim_descriptors import (
 )
 from hydrorelith.analysis.uma_torchsim_plots import (
     plot_coordination,
+    plot_coordination_with_band,
+    plot_density_equilibration_with_band,
     plot_heatmap_tp_grid,
     plot_msd_and_fit,
+    plot_mean_std_band,
     plot_pred_vs_exp,
     plot_rdf,
+    plot_rdf_with_band,
     plot_residence_proxy,
     plot_vacancy_metrics,
 )
@@ -64,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timestep-ps", type=float, default=0.001)
     parser.add_argument("--dump-every-steps", type=int, default=2)
     parser.add_argument("--retherm-steps-electrode", type=int, default=2000)
-    parser.add_argument("--retherm-steps-electrolyte", type=int, default=5000)
-    parser.add_argument("--prod-steps", type=int, default=15000)
+    parser.add_argument("--retherm-steps-electrolyte", type=int, default=8000)
+    parser.add_argument("--prod-steps", type=int, default=25000)
     parser.add_argument("--replicas", type=int, default=3)
     parser.add_argument("--base-seed", type=int, default=0)
     parser.add_argument("--compute-stress", action="store_true")
@@ -165,6 +169,15 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
         d_vals, cn_oh_vals, res_oh_vals, vac_vals = [], [], [], []
         li_msd_1ps_vals = []
         cond_meta: dict | None = None
+        msd_curves: list[np.ndarray] = []
+        rdf_curves: list[np.ndarray] = []
+        cn_water_curves: list[np.ndarray] = []
+        cn_oh_curves: list[np.ndarray] = []
+        density_curves: list[np.ndarray] = []
+        density_eq_start_times: list[float] = []
+        density_eq_means: list[float] = []
+        common_times: np.ndarray | None = None
+        rdf_r_axis: np.ndarray | None = None
 
         rep_bar = tqdm(rep_dirs, desc=f"{cond_dir.name}", unit="replica", leave=False)
         for rep_dir in rep_bar:
@@ -194,6 +207,7 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
             uw = unwrap_positions(positions, cells, pbc)
             li_idx = np.where(z == 3)[0]
             li_msd = compute_msd(uw, li_idx)
+            msd_curves.append(li_msd)
             fit = fit_diffusion_from_msd(
                 li_msd,
                 times,
@@ -271,6 +285,8 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
                     plot_root / f"{phase}_{cond_dir.name}_cn_time_series.png",
                     plot_root / f"{phase}_{cond_dir.name}_cn_hist.png",
                 )
+                cn_water_curves.append(np.asarray(cn["cn_water_series"], dtype=float))
+                cn_oh_curves.append(np.asarray(cn["cn_hydroxide_series"], dtype=float))
 
                 residence = compute_residence_proxy(
                     positions,
@@ -292,6 +308,19 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
                 desc["residence_proxy_oh"] = float(residence["residence_proxy_oh"])
                 desc["liOH_M"] = cond_meta.get("liOH_M") if cond_meta else None
                 desc["kOH_M"] = cond_meta.get("kOH_M") if cond_meta else None
+                if rdf_total["r_A"]:
+                    r_arr = np.asarray(rdf_total["r_A"], dtype=float)
+                    g_arr = np.asarray(rdf_total["g_r"], dtype=float)
+                    rdf_r_axis = r_arr
+                    rdf_curves.append(g_arr)
+                    shell_mask = (r_arr >= 1.5) & (r_arr <= 4.0)
+                    if np.any(shell_mask):
+                        local = np.where(shell_mask)[0]
+                        i_peak = int(local[np.argmax(g_arr[shell_mask])])
+                    else:
+                        i_peak = int(np.argmax(g_arr))
+                    desc["rdf_li_o_peak_r_A"] = float(r_arr[i_peak])
+                    desc["rdf_li_o_peak_g"] = float(g_arr[i_peak])
                 cn_oh_vals.append(desc["cn_hydroxide_mean"])
                 res_oh_vals.append(desc["residence_proxy_oh"])
             else:
@@ -336,6 +365,23 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
                 title=f"{phase} {cond_dir.name} {rep_dir.name}",
             )
             (rep_dir / "descriptors.json").write_text(json.dumps(desc, indent=2), encoding="utf-8")
+
+            if common_times is None:
+                common_times = np.asarray(times, dtype=float)
+
+            retherm_thermo = rep_dir / "retherm_thermo.csv"
+            retherm_eq = rep_dir / "retherm_equilibration.json"
+            if retherm_thermo.exists():
+                with retherm_thermo.open("r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    d_series = [float(r.get("density_g_cm3", 0.0)) for r in reader]
+                if d_series:
+                    density_curves.append(np.asarray(d_series, dtype=float))
+            if retherm_eq.exists():
+                eq_obj = json.loads(retherm_eq.read_text(encoding="utf-8"))
+                density_eq_start_times.append(float(eq_obj.get("equilibration_start_time_ps", 0.0)))
+                density_eq_means.append(float(eq_obj.get("equilibrated_density_mean_g_cm3", 0.0)))
+
             rep_bar.set_postfix_str(f"done {time.perf_counter() - t_rep:.1f}s")
         rep_bar.close()
 
@@ -353,14 +399,88 @@ def _analyze_phase(config: ScreenConfig, phase: str) -> list[dict]:
         }
         if phase == "electrolyte":
             cond_row["cn_hydroxide_mean"] = _mean_std(cn_oh_vals)[0]
+            cond_row["cn_hydroxide_std"] = _mean_std(cn_oh_vals)[1]
             cond_row["residence_proxy_oh"] = _mean_std(res_oh_vals)[0]
+            cond_row["residence_proxy_oh_std"] = _mean_std(res_oh_vals)[1]
             cond_row["liOH_M"] = float(cond_meta.get("liOH_M", 0.0))
             cond_row["kOH_M"] = float(cond_meta.get("kOH_M", 0.0))
+
+            if rdf_curves and rdf_r_axis is not None:
+                rdf_mat = np.vstack(rdf_curves)
+                rdf_mean = np.mean(rdf_mat, axis=0)
+                rdf_std = np.std(rdf_mat, axis=0)
+                plot_rdf_with_band(
+                    rdf_r_axis,
+                    rdf_mean,
+                    rdf_std,
+                    plot_root / f"{phase}_{cond_dir.name}_rdf_li_o_total_replicas_mean_std.png",
+                    "RDF Li-O total (replica mean +/- std)",
+                    cutoff_A=config.li_o_cutoff_A,
+                )
+                shell_mask = (rdf_r_axis >= 1.5) & (rdf_r_axis <= 4.0)
+                if np.any(shell_mask):
+                    local = np.where(shell_mask)[0]
+                    i_peak = int(local[np.argmax(rdf_mean[shell_mask])])
+                else:
+                    i_peak = int(np.argmax(rdf_mean))
+                cond_row["rdf_li_o_peak_r_A"] = float(rdf_r_axis[i_peak])
+                cond_row["rdf_li_o_peak_g"] = float(rdf_mean[i_peak])
+                cond_row["rdf_li_o_peak_g_std"] = float(rdf_std[i_peak])
+
+            if cn_water_curves and cn_oh_curves and common_times is not None:
+                cwm = np.mean(np.vstack(cn_water_curves), axis=0)
+                cws = np.std(np.vstack(cn_water_curves), axis=0)
+                cohm = np.mean(np.vstack(cn_oh_curves), axis=0)
+                cohs = np.std(np.vstack(cn_oh_curves), axis=0)
+                plot_coordination_with_band(
+                    common_times,
+                    cwm,
+                    cws,
+                    cohm,
+                    cohs,
+                    plot_root / f"{phase}_{cond_dir.name}_cn_time_series_replicas_mean_std.png",
+                )
+
+            if density_curves:
+                dmat = np.vstack(density_curves)
+                dmean = np.mean(dmat, axis=0)
+                dstd = np.std(dmat, axis=0)
+                eq_time = float(np.mean(density_eq_start_times)) if density_eq_start_times else 0.0
+                eq_den = float(np.mean(density_eq_means)) if density_eq_means else float(np.mean(dmean))
+                dtime = np.arange(dmean.shape[0], dtype=float) * (config.dump_every_steps * config.timestep_ps)
+                plot_density_equilibration_with_band(
+                    dtime,
+                    dmean,
+                    dstd,
+                    equilibration_time_ps=eq_time,
+                    avg_density_g_cm3=eq_den,
+                    out_path=plot_root / f"{phase}_{cond_dir.name}_density_retherm_equilibration.png",
+                )
+                cond_row["equilibrated_density_mean_g_cm3"] = eq_den
+                cond_row["equilibrated_density_std_g_cm3"] = (
+                    0.0 if not density_eq_means else float(np.std(np.asarray(density_eq_means, dtype=float)))
+                )
         else:
             cond_row["vacancy_accessibility_mean"] = _mean_std(vac_vals)[0]
+            cond_row["vacancy_accessibility_std"] = _mean_std(vac_vals)[1]
             cond_row["electrode_li_msd_1ps"] = _mean_std(li_msd_1ps_vals)[0]
+            cond_row["electrode_li_msd_1ps_std"] = _mean_std(li_msd_1ps_vals)[1]
             if "lithiation_fraction" in cond_meta:
                 cond_row["lithiation_fraction"] = float(cond_meta["lithiation_fraction"])
+
+        if msd_curves and common_times is not None:
+            mm = np.mean(np.vstack(msd_curves), axis=0)
+            ms = np.std(np.vstack(msd_curves), axis=0)
+            plot_mean_std_band(
+                common_times,
+                mm,
+                ms,
+                plot_root / f"{phase}_{cond_dir.name}_msd_li_replicas_mean_std.png",
+                title=f"{phase} {cond_dir.name} MSD Li (replica mean +/- std)",
+                xlabel="Time (ps)",
+                ylabel="MSD (A^2)",
+                label="MSD",
+            )
         rows.append(cond_row)
         tqdm.write(
             f"[analyze:{phase}] condition {cond_dir.name} complete in "

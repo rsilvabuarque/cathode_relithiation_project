@@ -27,6 +27,20 @@ def plot_msd_and_fit(times_ps, msd, fit: dict, out_path: Path, title: str = "MSD
     _save(fig, out_path)
 
 
+def plot_mean_std_band(x, mean_y, std_y, out_path: Path, title: str, xlabel: str, ylabel: str, label: str) -> None:
+    xv = np.asarray(x, dtype=float)
+    ym = np.asarray(mean_y, dtype=float)
+    ys = np.asarray(std_y, dtype=float)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(xv, ym, label=label)
+    ax.fill_between(xv, ym - ys, ym + ys, alpha=0.25, linewidth=0.0, label=f"{label} +/- 1 std")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    _save(fig, out_path)
+
+
 def plot_rdf(r_A, g_r, out_path: Path, title: str, cutoff_A: float | None = None) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(r_A, g_r)
@@ -35,6 +49,22 @@ def plot_rdf(r_A, g_r, out_path: Path, title: str, cutoff_A: float | None = None
     ax.set_xlabel("r (A)")
     ax.set_ylabel("g(r)")
     ax.set_title(title)
+    _save(fig, out_path)
+
+
+def plot_rdf_with_band(r_A, g_r_mean, g_r_std, out_path: Path, title: str, cutoff_A: float | None = None) -> None:
+    r = np.asarray(r_A, dtype=float)
+    gmean = np.asarray(g_r_mean, dtype=float)
+    gstd = np.asarray(g_r_std, dtype=float)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(r, gmean, label="mean g(r)")
+    ax.fill_between(r, gmean - gstd, gmean + gstd, alpha=0.25, linewidth=0.0, label="+/- 1 std")
+    if cutoff_A is not None:
+        ax.axvline(cutoff_A, color="tab:red", linestyle="--", linewidth=1.0)
+    ax.set_xlabel("r (A)")
+    ax.set_ylabel("g(r)")
+    ax.set_title(title)
+    ax.legend()
     _save(fig, out_path)
 
 
@@ -62,6 +92,32 @@ def plot_coordination(times_ps, cn_water, cn_hydroxide, out_ts: Path, out_hist: 
     _save(fig, out_hist)
 
 
+def plot_coordination_with_band(
+    times_ps,
+    cn_water_mean,
+    cn_water_std,
+    cn_hydroxide_mean,
+    cn_hydroxide_std,
+    out_ts: Path,
+) -> None:
+    t = np.asarray(times_ps, dtype=float)
+    cwm = np.asarray(cn_water_mean, dtype=float)
+    cws = np.asarray(cn_water_std, dtype=float)
+    cohm = np.asarray(cn_hydroxide_mean, dtype=float)
+    cohs = np.asarray(cn_hydroxide_std, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(t, cwm, label="water mean")
+    ax.fill_between(t, cwm - cws, cwm + cws, alpha=0.2, linewidth=0.0)
+    ax.plot(t, cohm, label="hydroxide mean")
+    ax.fill_between(t, cohm - cohs, cohm + cohs, alpha=0.2, linewidth=0.0)
+    ax.set_xlabel("Time (ps)")
+    ax.set_ylabel("CN")
+    ax.set_title("Li-O coordination (replica mean +/- std)")
+    ax.legend()
+    _save(fig, out_ts)
+
+
 def plot_residence_proxy(lag_ps, residence_proxy, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(lag_ps, residence_proxy)
@@ -85,6 +141,30 @@ def plot_vacancy_metrics(times_ps, vacancy_series, out_ts: Path, out_hist: Path)
     ax.set_ylabel("Count")
     ax.set_title("Vacancy summary histogram")
     _save(fig, out_hist)
+
+
+def plot_density_equilibration_with_band(
+    times_ps,
+    density_mean,
+    density_std,
+    equilibration_time_ps,
+    avg_density_g_cm3,
+    out_path: Path,
+) -> None:
+    t = np.asarray(times_ps, dtype=float)
+    dmean = np.asarray(density_mean, dtype=float)
+    dstd = np.asarray(density_std, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(t, dmean, label="density mean")
+    ax.fill_between(t, dmean - dstd, dmean + dstd, alpha=0.25, linewidth=0.0, label="+/- 1 std")
+    ax.axvline(float(equilibration_time_ps), color="tab:orange", linestyle="--", linewidth=1.2, label="equilibration cutoff")
+    ax.axhline(float(avg_density_g_cm3), color="tab:green", linestyle=":", linewidth=1.4, label="production density average")
+    ax.set_xlabel("Time (ps)")
+    ax.set_ylabel("Density (g/cm^3)")
+    ax.set_title("NPT rethermalization density evolution")
+    ax.legend()
+    _save(fig, out_path)
 
 
 def plot_pred_vs_exp(y_pred, y_true, out_path: Path) -> None:

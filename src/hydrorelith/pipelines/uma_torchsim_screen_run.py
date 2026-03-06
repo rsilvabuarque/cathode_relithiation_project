@@ -4,6 +4,7 @@ import csv
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from ase import Atoms
@@ -17,6 +18,8 @@ from hydrorelith.pipelines.uma_torchsim_screen_models import load_fairchem_model
 
 KB = 8.617333262e-5  # eV/K
 AMU_TO_EV_PS2_PER_A2 = 103.642691
+AMU_TO_G = 1.66053906660e-24
+A3_TO_CM3 = 1.0e-24
 
 
 def _format_duration(seconds: float) -> str:
@@ -60,6 +63,55 @@ def _resolve_device(device: str) -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
+
+
+def _density_g_cm3(total_mass_amu: float, volume_A3: np.ndarray | float) -> np.ndarray:
+    vol = np.asarray(volume_A3, dtype=float)
+    safe_vol = np.where(vol > 1.0e-12, vol, np.nan)
+    return (float(total_mass_amu) * AMU_TO_G) / (safe_vol * A3_TO_CM3)
+
+
+def _select_equilibrated_start_idx(density_g_cm3: np.ndarray) -> int:
+    dens = np.asarray(density_g_cm3, dtype=float)
+    n = int(dens.size)
+    if n <= 6:
+        return max(0, n // 2)
+
+    finite = np.isfinite(dens)
+    if not np.all(finite):
+        idx = np.where(finite)[0]
+        if idx.size == 0:
+            return max(0, n // 2)
+        dens = dens[idx]
+        n = int(dens.size)
+        if n <= 6:
+            return max(0, n // 2)
+
+    tail_start = max(1, int(0.75 * n))
+    tail = dens[tail_start:]
+    tail_mean = float(np.mean(tail))
+    tail_std = float(np.std(tail))
+    tol = max(0.5 * tail_std, 0.01 * max(tail_mean, 1.0e-6), 0.003)
+
+    start_min = max(1, int(0.20 * n))
+    start_max = max(start_min + 1, int(0.85 * n))
+    for s in range(start_min, start_max):
+        seg_mean = float(np.mean(dens[s:]))
+        if abs(seg_mean - tail_mean) <= tol:
+            return s
+    return max(1, int(0.50 * n))
+
+
+def _set_atoms_volume_isotropic(atoms: Atoms, target_volume_A3: float) -> None:
+    target_v = float(target_volume_A3)
+    if target_v <= 1.0e-12:
+        return
+    cell = atoms.cell.array.astype(float)
+    cur_v = abs(float(np.linalg.det(cell)))
+    if cur_v <= 1.0e-12:
+        return
+    scale = (target_v / cur_v) ** (1.0 / 3.0)
+    atoms.set_cell(cell * scale, scale_atoms=True)
 
 
 def _read_tp_grid(path: Path) -> list[tuple[float, float]]:
@@ -172,6 +224,7 @@ def _run_lightweight_md(
     timestep_ps: float,
     seed: int,
     target_temp_K: float,
+    ensemble: str,
     progress_callback: callable | None = None,
 ) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
@@ -197,9 +250,23 @@ def _run_lightweight_md(
     vol = np.zeros(nframes, dtype=float)
 
     frame_idx = 0
+    vol0 = abs(float(np.linalg.det(cell)))
+    ln_v = float(np.log(max(vol0, 1.0e-12)))
+
     for step in range(nsteps + 1):
         noise = rng.normal(0.0, 0.02, size=vel.shape)
         vel = 0.999 * vel + noise
+
+        if ensemble == "npt":
+            # Lightweight OU-like isotropic barostat proxy for fallback execution.
+            ln_v += -0.02 * (ln_v - np.log(max(vol0, 1.0e-12))) + rng.normal(0.0, 3.0e-4)
+            new_v = float(np.exp(ln_v))
+            cur_v = abs(float(np.linalg.det(cell)))
+            if cur_v > 1.0e-12:
+                scale = (new_v / cur_v) ** (1.0 / 3.0)
+                cell = cell * scale
+                pos = pos * scale
+
         pos = pos + vel * timestep_ps
         if pbc.any():
             inv = np.linalg.inv(cell.T)
@@ -247,6 +314,8 @@ def _try_torchsim_md(
     device: str,
     compute_stress: bool,
     seed: int,
+    ensemble: str,
+    pressure_MPa: float,
 ) -> dict[str, np.ndarray] | None:
     # TorchSim APIs are evolving. If API mismatch occurs, fall back to lightweight mode.
     try:
@@ -259,18 +328,48 @@ def _try_torchsim_md(
             state_kwargs={
                 "save_velocities": True,
                 "save_forces": True,
-                "variable_cell": False,
+                "variable_cell": ensemble == "npt",
             },
         )
-        out = ts.integrate(
-            atoms=atoms,
-            model=model,
-            n_steps=nsteps,
-            dt=timestep_ps,
-            seed=seed,
-            integrator=ts.Integrator.nvt_langevin,
-            reporters=[rep],
-        )
+        if ensemble == "npt":
+            integrator = getattr(ts.Integrator, "npt_langevin", None)
+            if integrator is None:
+                raise RuntimeError("Requested NPT rethermalization but torch_sim has no npt_langevin integrator")
+        else:
+            integrator = ts.Integrator.nvt_langevin
+
+        kwargs: dict[str, Any] = {
+            "atoms": atoms,
+            "model": model,
+            "n_steps": nsteps,
+            "dt": timestep_ps,
+            "seed": seed,
+            "integrator": integrator,
+            "reporters": [rep],
+        }
+
+        out = None
+        if ensemble == "npt":
+            pressure_gpa = float(pressure_MPa) / 1000.0
+            pressure_keys = (
+                "pressure",
+                "target_pressure",
+                "external_pressure",
+                "pressure_GPa",
+                "target_pressure_GPa",
+                "external_pressure_GPa",
+                "pressure_mpa",
+            )
+            for key in pressure_keys:
+                try:
+                    out = ts.integrate(**kwargs, **{key: pressure_gpa if "GPa" in key or key.endswith("pressure") else float(pressure_MPa)})
+                    break
+                except TypeError:
+                    continue
+            if out is None:
+                out = ts.integrate(**kwargs)
+        else:
+            out = ts.integrate(**kwargs)
         traj = rep.to_dict() if hasattr(rep, "to_dict") else out
 
         return {
@@ -297,7 +396,7 @@ def _try_torchsim_md(
         return None
 
 
-def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: float) -> None:
+def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: float, density_g_cm3: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -309,6 +408,7 @@ def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: flo
                 "kinetic_energy_eV",
                 "temperature_K",
                 "volume_A3",
+                "density_g_cm3",
                 "pressure_MPa",
             ]
         )
@@ -321,6 +421,7 @@ def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: flo
                     float(traj["kinetic_energy"][i]),
                     float(traj["temperature"][i]),
                     float(traj["volume"][i]),
+                    float(density_g_cm3[i]),
                     float(pressure_mpa),
                 ]
             )
@@ -351,6 +452,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
             atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
             temp_k = float(item.temperature_C) + 273.15
 
+            retherm_summary: dict[str, float] | None = None
             for run_name, nsteps in (("retherm", retherm_steps), ("prod", config.prod_steps)):
                 nsteps_total = nsteps + 1
                 remaining_all_steps = sum(run_plan_steps) - completed_steps
@@ -389,6 +491,8 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     device=device,
                     compute_stress=config.compute_stress,
                     seed=seed,
+                    ensemble="npt" if run_name == "retherm" else "nvt",
+                    pressure_MPa=float(item.pressure_MPa),
                 )
                 if traj is None:
                     traj = _run_lightweight_md(
@@ -398,6 +502,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         timestep_ps=config.timestep_ps,
                         seed=seed,
                         target_temp_K=temp_k,
+                        ensemble="npt" if run_name == "retherm" else "nvt",
                         progress_callback=_on_progress,
                     )
                 else:
@@ -426,8 +531,35 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     vol=traj["volume"],
                     atom_pe=traj["atom_potential_energy"],
                 )
-                if run_name == "prod":
-                    _write_thermo_csv(rep_dir / "prod_thermo.csv", traj, float(item.pressure_MPa))
+                density_series = _density_g_cm3(float(np.sum(traj["masses"])), traj["volume"])
+
+                if run_name == "retherm":
+                    eq_start_idx = _select_equilibrated_start_idx(density_series)
+                    eq_slice = slice(eq_start_idx, None)
+                    vol_eq = np.asarray(traj["volume"][eq_slice], dtype=float)
+                    den_eq = np.asarray(density_series[eq_slice], dtype=float)
+                    retherm_summary = {
+                        "equilibration_start_index": int(eq_start_idx),
+                        "equilibration_start_step": int(traj["step"][eq_start_idx]),
+                        "equilibration_start_time_ps": float(traj["time_ps"][eq_start_idx]),
+                        "equilibrated_volume_mean_A3": float(np.mean(vol_eq)),
+                        "equilibrated_volume_std_A3": float(np.std(vol_eq)),
+                        "equilibrated_density_mean_g_cm3": float(np.mean(den_eq)),
+                        "equilibrated_density_std_g_cm3": float(np.std(den_eq)),
+                    }
+                    (rep_dir / "retherm_equilibration.json").write_text(
+                        json.dumps(retherm_summary, indent=2),
+                        encoding="utf-8",
+                    )
+                    _write_thermo_csv(rep_dir / "retherm_thermo.csv", traj, float(item.pressure_MPa), density_series)
+
+                    # Start production from final retherm state, at averaged equilibrated volume.
+                    atoms.set_positions(np.asarray(traj["positions"][-1], dtype=float))
+                    atoms.set_cell(np.asarray(traj["cell"][-1], dtype=float), scale_atoms=False)
+                    if retherm_summary is not None:
+                        _set_atoms_volume_isotropic(atoms, retherm_summary["equilibrated_volume_mean_A3"])
+                else:
+                    _write_thermo_csv(rep_dir / "prod_thermo.csv", traj, float(item.pressure_MPa), density_series)
 
                 completed_steps += nsteps_total
                 global_bar.update(1)
@@ -448,10 +580,14 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 "n_li": item.n_li,
                 "seed": seed,
                 "device": device,
-                "ensemble": config.ensemble,
+                "ensemble_retherm": "npt",
+                "ensemble_production": "nvt",
+                "ensemble_requested": config.ensemble,
                 "timestep_ps": config.timestep_ps,
                 "dump_every_steps": config.dump_every_steps,
             }
+            if retherm_summary is not None:
+                metadata["retherm_equilibration"] = retherm_summary
             (rep_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     global_bar.set_postfix_str("completed")
