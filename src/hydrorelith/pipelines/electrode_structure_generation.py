@@ -66,7 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-structures", type=int, default=600)
     parser.add_argument("--oversampling-factor", type=int, default=10)
     parser.add_argument("--min-lithiation-fraction", type=float, default=0.75)
-    parser.add_argument("--lithiation-step", type=float, default=0.05)
+    parser.add_argument(
+        "--lithiation-step",
+        type=float,
+        default=0.05,
+        help=(
+            "Legacy bin step retained for bootstrap tree layout only. "
+            "Delithiation candidate generation now enumerates all discrete Li occupancies."
+        ),
+    )
     parser.add_argument("--max-removal-combinations-per-fraction", type=int, default=200)
     parser.add_argument("--rattle-method", choices=["mc", "gaussian", "phonon"], default="mc")
     parser.add_argument(
@@ -645,17 +653,24 @@ class ElectrodeStructureGenerationPipeline:
             )
 
     def _build_delithiation_targets(self, total_ion_sites: int) -> list[tuple[int, float]]:
-        desired_fractions = self._build_lithiation_grid()
-        unique_remove_counts: set[int] = set()
+        min_lithiation = self.config.sampling.min_lithiation_fraction
+        # Keep occupancy levels within 1% below the requested minimum lithiation.
+        below_min_tolerance = 0.01
+
         targets: list[tuple[int, float]] = []
-        for desired_fraction in desired_fractions:
-            remove_count = int(round((1.0 - desired_fraction) * total_ion_sites))
-            remove_count = max(0, min(remove_count, total_ion_sites))
-            if remove_count in unique_remove_counts:
-                continue
-            unique_remove_counts.add(remove_count)
+        for remove_count in range(total_ion_sites + 1):
             actual_fraction = (total_ion_sites - remove_count) / total_ion_sites
-            targets.append((remove_count, actual_fraction))
+            if actual_fraction >= min_lithiation:
+                targets.append((remove_count, actual_fraction))
+                continue
+
+            if (min_lithiation - actual_fraction) <= below_min_tolerance:
+                targets.append((remove_count, actual_fraction))
+                continue
+
+            # Further remove_count values only decrease lithiation, so we can stop.
+            break
+
         return targets
 
     def _sample_delithiation_combinations(
