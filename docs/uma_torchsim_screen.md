@@ -2,6 +2,10 @@
 
 `uma_torchsim_screen` is a GPU-first screening workflow for hydrothermal relithiation studies using TorchSim batched MD + FAIRChem UMA.
 
+MD execution policy:
+- The workflow is fail-fast and does not use a lightweight non-TorchSim fallback.
+- MD runs are executed with batched TorchSim trajectories and then converted into analysis-ready `*.h5md` files.
+
 Thermostat/barostat policy:
 - `retherm` is run in NPT to relax density/volume at target T/P.
 - `prod` is run in NVT and initialized from the NPT endpoint, with cell rescaled to the replica-averaged equilibrated volume from NPT.
@@ -59,6 +63,16 @@ Key runtime defaults:
 - `--prod-steps 25000`
 - `--replicas 3`
 
+Batching/throughput controls:
+- `--max-memory-scaler <float>` to reuse a known scaler and avoid repeated estimation.
+- `--skip-batch-benchmark` to disable the optional batch-scaling benchmark.
+- `--benchmark-steps`, `--benchmark-warmup-steps`, `--benchmark-max-systems`, `--benchmark-step-size`.
+- `--precision {float32,float64}` and `--debug` for runtime diagnostics.
+
+Resume behavior:
+- Re-running MD in the same output directory resumes from existing TorchSim trajectory files when possible.
+- If per-cohort trajectories disagree on last step, they are truncated to the common minimum step before resuming.
+
 Full run:
 
 ```bash
@@ -69,6 +83,10 @@ hrw-uma-torchsim-screen \
   --phase both \
   --stage all \
   --device cuda \
+  --max-memory-scaler 12000 \
+  --benchmark-max-systems 32 \
+  --benchmark-step-size 2 \
+  --precision float32 \
   --electrode-reference-pristine default_structures/electrolyte_templates/Li.cif
 ```
 
@@ -100,6 +118,10 @@ Templates are under `scripts/slurm/perlmutter/`:
 - `run_export2pt.sbatch`
 
 These request one GPU by default and include a commented 4-GPU variant plus array-job hints.
+
+Recommended for production reruns on fixed manifests:
+- Persist and reuse `--max-memory-scaler` from a prior run.
+- Keep benchmark enabled for first calibration run, then use `--skip-batch-benchmark` for follow-up campaigns.
 
 ## 2PT Export
 
@@ -133,9 +155,16 @@ The workflow writes:
 
 - `electrode/<condition_id>/replica_000/{retherm.h5md,retherm_thermo.csv,retherm_equilibration.json,prod.h5md,prod_thermo.csv,descriptors.json}`
 - `electrolyte/<condition_id>/replica_000/{...}`
+- `electrode/<condition_id>/replica_000/{retherm.trajectory.h5,prod.trajectory.h5,retherm_thermo_detailed.csv,prod_thermo_detailed.csv}`
+- `electrolyte/<condition_id>/replica_000/{...}`
 - `export2pt/<phase>/<condition_id>/replica_000/{prod.lammpstrj,type_map.json,2pt_metadata.json}`
 - `merged/{features.csv,regression_summary.json,pred_vs_true.csv}`
 - `plots/*.png`
+
+Phase-level run metadata and optional benchmark artifacts:
+- `<output_dir>/uma_torchsim_screen/<phase>/run_config.json`
+- `<output_dir>/uma_torchsim_screen/<phase>/run_state.json`
+- `<output_dir>/uma_torchsim_screen/<phase>/batch_benchmark/batch_scaling.csv` (when benchmark enabled)
 
 Plot set includes MSD/fits, RDF, CN traces + histogram, residence proxy, oxygen species counts, vacancy metrics, predicted-vs-experimental, and faceted T/P heatmaps.
 

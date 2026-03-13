@@ -13,3 +13,5 @@ dist/
 
 for_chat_gpt/
 results/dry_run_engine_all_*/
+results/
+runs/

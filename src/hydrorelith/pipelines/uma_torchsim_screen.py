@@ -83,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vacancy-site-match-cutoff-A", type=float, default=1.0)
     parser.add_argument("--analysis-frame-stride", type=int, default=None)
     parser.add_argument("--plots", action="store_true")
+    parser.add_argument("--max-memory-scaler", type=float, default=None)
+    parser.add_argument("--skip-batch-benchmark", action="store_true")
+    parser.add_argument("--benchmark-steps", type=int, default=40)
+    parser.add_argument("--benchmark-warmup-steps", type=int, default=5)
+    parser.add_argument("--benchmark-max-systems", type=int, default=None)
+    parser.add_argument("--benchmark-step-size", type=int, default=1)
+    parser.add_argument("--benchmark-temperature-k", type=float, default=298.0)
+    parser.add_argument("--precision", choices=["float32", "float64"], default="float32")
+    parser.add_argument("--debug", action="store_true")
     return parser
 
 

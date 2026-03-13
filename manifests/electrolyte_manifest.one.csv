@@ -1,0 +1,2 @@
+condition_id,structure_path,temperature_C,pressure_MPa,liOH_M,kOH_M,phase,task_name,charge,spin,notes
+el_li0p00_k4p13_T120_P0p08_rep01,for_chat_gpt/electrolyte_tree/LiOH_0.00M_KOH_4.13M/T120_P0p08/el_li0p00_k4p13_T120_P0p08_rep01.cif,120,0.08,0,4.13,electrolyte,omol,0,1,

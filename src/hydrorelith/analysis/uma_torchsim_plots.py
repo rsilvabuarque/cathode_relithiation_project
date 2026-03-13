@@ -122,7 +122,7 @@ def plot_residence_proxy(lag_ps, residence_proxy, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(lag_ps, residence_proxy)
     ax.set_xlabel("Lag (ps)")
-    ax.set_ylabel("Residence proxy")
+    ax.set_ylabel("Residence proxy (fraction, unitless)")
     ax.set_title("Residence-proxy curve")
     _save(fig, out_path)
 

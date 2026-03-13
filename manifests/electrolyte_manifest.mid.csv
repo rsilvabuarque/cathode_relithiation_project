@@ -1,0 +1,2 @@
+condition_id,structure_path,temperature_C,pressure_MPa,liOH_M,kOH_M,phase,task_name,charge,spin,notes
+el_li2p06_k2p06_T200_P1p32_rep01,for_chat_gpt/electrolyte_tree/LiOH_2.06M_KOH_2.06M/T200_P1p32/el_li2p06_k2p06_T200_P1p32_rep01.cif,200,1.32,2.06,2.06,electrolyte,omol,0,1,

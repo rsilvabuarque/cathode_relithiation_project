@@ -1,0 +1,5 @@
+condition_id,structure_path,temperature_C,pressure_MPa,liOH_M,kOH_M,phase,task_name,charge,spin,notes
+el_li0p00_k4p13_T120_P0p08_rep01,for_chat_gpt/electrolyte_tree/LiOH_0.00M_KOH_4.13M/T120_P0p08/el_li0p00_k4p13_T120_P0p08_rep01.cif,120,0.08,0,4.13,electrolyte,omol,0,1,
+el_li0p00_k4p13_T160_P0p46_rep01,for_chat_gpt/electrolyte_tree/LiOH_0.00M_KOH_4.13M/T160_P0p46/el_li0p00_k4p13_T160_P0p46_rep01.cif,160,0.46,0,4.13,electrolyte,omol,0,1,
+el_li0p00_k4p13_T200_P1p32_rep01,for_chat_gpt/electrolyte_tree/LiOH_0.00M_KOH_4.13M/T200_P1p32/el_li0p00_k4p13_T200_P1p32_rep01.cif,200,1.32,0,4.13,electrolyte,omol,0,1,
+el_li0p00_k4p13_T220_P2p02_rep01,for_chat_gpt/electrolyte_tree/LiOH_0.00M_KOH_4.13M/T220_P2p02/el_li0p00_k4p13_T220_P2p02_rep01.cif,220,2.02,0,4.13,electrolyte,omol,0,1,

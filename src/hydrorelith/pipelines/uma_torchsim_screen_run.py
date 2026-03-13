@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,22 @@ KB = 8.617333262e-5  # eV/K
 AMU_TO_EV_PS2_PER_A2 = 103.642691
 AMU_TO_G = 1.66053906660e-24
 A3_TO_CM3 = 1.0e-24
+PA_PER_EV_A3 = 1.602176634e11
+EV_A3_PER_ATM = 101325.0 / PA_PER_EV_A3
+THERMO_COLUMNS = [
+    "step",
+    "time_fs",
+    "temperature_K",
+    "pressure_eV_per_A3",
+    "pressure_atm",
+    "volume_A3",
+    "density_g_cm3",
+    "potential_energy_eV",
+    "kinetic_energy_eV",
+    "total_energy_eV",
+    "delta_total_energy_eV",
+    "wall_delta_s",
+]
 
 
 def _format_duration(seconds: float) -> str:
@@ -52,6 +70,11 @@ class _EmaRateTracker:
         if self.steps_per_sec is None or self.steps_per_sec <= 0:
             return None
         return float(remaining_steps) / self.steps_per_sec
+
+
+def _debug_log(config: ScreenConfig, msg: str) -> None:
+    if config.debug:
+        tqdm.write(f"[debug] {msg}")
 
 
 def _resolve_device(device: str) -> str:
@@ -114,6 +137,30 @@ def _set_atoms_volume_isotropic(atoms: Atoms, target_volume_A3: float) -> None:
     atoms.set_cell(cell * scale, scale_atoms=True)
 
 
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _update_run_state(path: Path, **updates: Any) -> dict[str, Any]:
+    state = _read_json_if_exists(path) or {}
+    state.update(updates)
+    state["updated_at_unix_s"] = int(time.time())
+    _write_json_atomic(path, state)
+    return state
+
+
 def _read_tp_grid(path: Path) -> list[tuple[float, float]]:
     rows: list[tuple[float, float]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -169,7 +216,7 @@ def _load_items_for_phase(config: ScreenConfig, phase: str) -> list[StructureIte
     return items
 
 
-def _write_h5md_like(
+def _write_h5md_flat(
     out_path: Path,
     atomic_numbers: np.ndarray,
     masses: np.ndarray,
@@ -217,201 +264,11 @@ def _temperature_from_ke(ke_eV: float, natoms: int) -> float:
     return float((2.0 * ke_eV) / (dof * KB))
 
 
-def _run_lightweight_md(
-    atoms: Atoms,
-    nsteps: int,
-    save_every: int,
-    timestep_ps: float,
-    seed: int,
-    target_temp_K: float,
-    ensemble: str,
-    progress_callback: callable | None = None,
-) -> dict[str, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    pos = atoms.get_positions().astype(float)
-    cell = atoms.cell.array.astype(float)
-    pbc = np.array(atoms.pbc, dtype=bool)
-    masses = atoms.get_masses().astype(float)
-    z = atoms.get_atomic_numbers().astype(int)
-
-    sigma = np.sqrt((KB * target_temp_K) / np.maximum(masses, 1e-8) * AMU_TO_EV_PS2_PER_A2)
-    vel = rng.normal(0.0, sigma[:, None], size=pos.shape)
-
-    steps = np.arange(0, nsteps + 1, save_every, dtype=int)
-    nframes = len(steps)
-    natoms = len(atoms)
-    positions = np.zeros((nframes, natoms, 3), dtype=float)
-    velocities = np.zeros_like(positions)
-    forces = np.zeros_like(positions)
-    cells = np.repeat(cell[None, :, :], nframes, axis=0)
-    pe = np.zeros(nframes, dtype=float)
-    ke = np.zeros(nframes, dtype=float)
-    temp = np.zeros(nframes, dtype=float)
-    vol = np.zeros(nframes, dtype=float)
-
-    frame_idx = 0
-    vol0 = abs(float(np.linalg.det(cell)))
-    ln_v = float(np.log(max(vol0, 1.0e-12)))
-
-    for step in range(nsteps + 1):
-        noise = rng.normal(0.0, 0.02, size=vel.shape)
-        vel = 0.999 * vel + noise
-
-        if ensemble == "npt":
-            # Lightweight OU-like isotropic barostat proxy for fallback execution.
-            ln_v += -0.02 * (ln_v - np.log(max(vol0, 1.0e-12))) + rng.normal(0.0, 3.0e-4)
-            new_v = float(np.exp(ln_v))
-            cur_v = abs(float(np.linalg.det(cell)))
-            if cur_v > 1.0e-12:
-                scale = (new_v / cur_v) ** (1.0 / 3.0)
-                cell = cell * scale
-                pos = pos * scale
-
-        pos = pos + vel * timestep_ps
-        if pbc.any():
-            inv = np.linalg.inv(cell.T)
-            frac = pos @ inv
-            frac = frac - np.floor(frac)
-            pos = frac @ cell
-
-        if step % save_every == 0:
-            positions[frame_idx] = pos
-            velocities[frame_idx] = vel
-            forces[frame_idx] = 0.0
-            ke[frame_idx] = _ke_eV(masses, vel)
-            temp[frame_idx] = _temperature_from_ke(ke[frame_idx], natoms)
-            vol[frame_idx] = abs(np.linalg.det(cell))
-            frame_idx += 1
-
-        if progress_callback is not None:
-            progress_callback(step + 1)
-
-    return {
-        "atomic_numbers": z,
-        "masses": masses,
-        "positions": positions,
-        "velocities": velocities,
-        "forces": forces,
-        "cell": cells,
-        "pbc": pbc,
-        "step": steps,
-        "time_ps": steps.astype(float) * timestep_ps,
-        "potential_energy": pe,
-        "kinetic_energy": ke,
-        "temperature": temp,
-        "volume": vol,
-        "atom_potential_energy": None,
-    }
-
-
-def _try_torchsim_md(
-    atoms: Atoms,
-    nsteps: int,
-    save_every: int,
-    timestep_ps: float,
-    model_name: str,
-    task_name: str,
-    device: str,
-    compute_stress: bool,
-    seed: int,
-    ensemble: str,
-    pressure_MPa: float,
-) -> dict[str, np.ndarray] | None:
-    # TorchSim APIs are evolving. If API mismatch occurs, fall back to lightweight mode.
-    try:
-        import torch_sim as ts
-        from torch_sim.io import TrajectoryReporter
-
-        model = load_fairchem_model(model_name, task_name, device, compute_stress)
-        rep = TrajectoryReporter(
-            state_frequency=save_every,
-            state_kwargs={
-                "save_velocities": True,
-                "save_forces": True,
-                "variable_cell": ensemble == "npt",
-            },
-        )
-        if ensemble == "npt":
-            integrator = getattr(ts.Integrator, "npt_langevin", None)
-            if integrator is None:
-                raise RuntimeError("Requested NPT rethermalization but torch_sim has no npt_langevin integrator")
-        else:
-            integrator = ts.Integrator.nvt_langevin
-
-        kwargs: dict[str, Any] = {
-            "atoms": atoms,
-            "model": model,
-            "n_steps": nsteps,
-            "dt": timestep_ps,
-            "seed": seed,
-            "integrator": integrator,
-            "reporters": [rep],
-        }
-
-        out = None
-        if ensemble == "npt":
-            pressure_gpa = float(pressure_MPa) / 1000.0
-            pressure_keys = (
-                "pressure",
-                "target_pressure",
-                "external_pressure",
-                "pressure_GPa",
-                "target_pressure_GPa",
-                "external_pressure_GPa",
-                "pressure_mpa",
-            )
-            for key in pressure_keys:
-                try:
-                    out = ts.integrate(**kwargs, **{key: pressure_gpa if "GPa" in key or key.endswith("pressure") else float(pressure_MPa)})
-                    break
-                except TypeError:
-                    continue
-            if out is None:
-                out = ts.integrate(**kwargs)
-        else:
-            out = ts.integrate(**kwargs)
-        traj = rep.to_dict() if hasattr(rep, "to_dict") else out
-
-        return {
-            "atomic_numbers": np.array(traj["atomic_numbers"], dtype=int),
-            "masses": np.array(traj["masses"], dtype=float),
-            "positions": np.array(traj["positions"], dtype=float),
-            "velocities": np.array(traj["velocities"], dtype=float),
-            "forces": np.array(traj.get("forces", 0.0), dtype=float),
-            "cell": np.array(traj["cell"], dtype=float),
-            "pbc": np.array(traj["pbc"], dtype=bool),
-            "step": np.array(traj["step"], dtype=int),
-            "time_ps": np.array(traj["time_ps"], dtype=float),
-            "potential_energy": np.array(traj.get("potential_energy", 0.0), dtype=float),
-            "kinetic_energy": np.array(traj.get("kinetic_energy", 0.0), dtype=float),
-            "temperature": np.array(traj.get("temperature", 0.0), dtype=float),
-            "volume": np.array(traj.get("volume", 0.0), dtype=float),
-            "atom_potential_energy": (
-                np.array(traj.get("atom_energy"), dtype=float)
-                if traj.get("atom_energy") is not None
-                else None
-            ),
-        }
-    except Exception:
-        return None
-
-
-def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: float, density_g_cm3: np.ndarray) -> None:
+def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "step",
-                "time_ps",
-                "potential_energy_eV",
-                "kinetic_energy_eV",
-                "temperature_K",
-                "volume_A3",
-                "density_g_cm3",
-                "pressure_MPa",
-            ]
-        )
+        writer.writerow(["step", "time_ps", "potential_energy_eV", "kinetic_energy_eV", "temperature_K", "volume_A3", "density_g_cm3", "pressure_MPa"])
         for i in range(len(traj["step"])):
             writer.writerow(
                 [
@@ -421,40 +278,506 @@ def _write_thermo_csv(path: Path, traj: dict[str, np.ndarray], pressure_mpa: flo
                     float(traj["kinetic_energy"][i]),
                     float(traj["temperature"][i]),
                     float(traj["volume"][i]),
-                    float(density_g_cm3[i]),
-                    float(pressure_mpa),
+                    float(traj["density_g_cm3"][i]),
+                    float(traj["pressure_MPa"][i]),
                 ]
             )
 
 
-def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str) -> None:
-    out_root = config.output_dir / "uma_torchsim_screen" / phase
-    device = _resolve_device(config.device)
-    retherm_steps = config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
+def _get_dtype(config: ScreenConfig):
+    import torch
 
-    # Two runs per replica: rethermalization and production.
+    return torch.float64 if config.precision == "float64" else torch.float32
+
+
+def _build_autobatcher(ts, model, config: ScreenConfig, max_memory_scaler: float | None):
+    model_device = getattr(model, "device", None)
+    if str(model_device) == "cpu":
+        return False
+    if max_memory_scaler is None:
+        return True
+    return ts.BinningAutoBatcher(model=model, max_memory_scaler=float(max_memory_scaler))
+
+
+def _pick_integrator(ts, ensemble: str):
+    if ensemble == "npt":
+        return ts.Integrator.npt_nose_hoover
+    return ts.Integrator.nvt_langevin
+
+
+def _build_prop_calculators(ts):
+    prev_total = {"value": None}
+    prev_wall = {"value": None}
+
+    def _volume(state, model=None):
+        import torch
+
+        return torch.abs(torch.linalg.det(state.cell))
+
+    def _kinetic_energy(state, model=None):
+        return ts.calc_kinetic_energy(masses=state.masses, momenta=state.momenta, system_idx=state.system_idx)
+
+    def _potential_energy(state, model=None):
+        import torch
+
+        if torch.is_tensor(state.energy):
+            if state.energy.ndim == 0:
+                return state.energy.reshape(1).repeat(int(state.cell.shape[0]))
+            return state.energy.reshape(-1)
+        return torch.full((int(state.cell.shape[0]),), float(state.energy), device=state.positions.device, dtype=state.positions.dtype)
+
+    def _temperature(state, model=None):
+        return ts.calc_temperature(masses=state.masses, momenta=state.momenta, system_idx=state.system_idx)
+
+    def _density(state, model=None):
+        import torch
+
+        nsys = int(state.cell.shape[0])
+        m = torch.zeros(nsys, device=state.masses.device, dtype=state.masses.dtype)
+        m.index_add_(0, state.system_idx.long(), state.masses)
+        v = _volume(state)
+        return (m * AMU_TO_G) / (v * A3_TO_CM3)
+
+    def _pressure_ev_a3(state, model=None):
+        if model is None:
+            raise RuntimeError("Pressure reporter requires model")
+        out = model(state)
+        if "stress" not in out:
+            raise RuntimeError("Model output has no stress tensor; set compute_stress=True")
+        return ts.get_pressure(out["stress"], _kinetic_energy(state), _volume(state))
+
+    def _pressure_atm(state, model=None):
+        return _pressure_ev_a3(state, model) * (PA_PER_EV_A3 / 101325.0)
+
+    def _total_energy(state, model=None):
+        return _potential_energy(state) + _kinetic_energy(state)
+
+    def _delta_total(state, model=None):
+        import torch
+
+        cur = _total_energy(state).detach().clone()
+        if prev_total["value"] is None:
+            out = torch.full_like(cur, float("nan"))
+        else:
+            out = cur - prev_total["value"]
+        prev_total["value"] = cur
+        return out
+
+    def _wall_delta(state, model=None):
+        import torch
+
+        now = time.perf_counter()
+        nsys = int(state.cell.shape[0])
+        if prev_wall["value"] is None:
+            out = torch.full((nsys,), float("nan"), device=state.positions.device, dtype=state.positions.dtype)
+        else:
+            out = torch.full((nsys,), now - prev_wall["value"], device=state.positions.device, dtype=state.positions.dtype)
+        prev_wall["value"] = now
+        return out
+
+    return {
+        1: {
+            "temperature_K": lambda state, model=None: _temperature(state),
+            "pressure_eV_per_A3": lambda state, model=None: _pressure_ev_a3(state, model),
+            "pressure_atm": lambda state, model=None: _pressure_atm(state, model),
+            "volume_A3": lambda state, model=None: _volume(state),
+            "density_g_cm3": lambda state, model=None: _density(state),
+            "potential_energy_eV": lambda state, model=None: _potential_energy(state),
+            "kinetic_energy_eV": lambda state, model=None: _kinetic_energy(state),
+            "total_energy_eV": lambda state, model=None: _total_energy(state),
+            "delta_total_energy_eV": _delta_total,
+            "wall_delta_s": _wall_delta,
+        }
+    }
+
+
+def _export_thermo_from_torchsim(ts, input_h5: Path, out_csv: Path, timestep_fs: float) -> None:
+    rows_by_step: dict[int, dict[str, float]] = {}
+    with ts.TorchSimTrajectory(str(input_h5), mode="r") as traj:
+        for key in THERMO_COLUMNS[2:]:
+            try:
+                steps = np.asarray(traj.get_steps(key), dtype=int)
+                values = np.asarray(traj.get_array(key))
+            except Exception:
+                continue
+
+            if values.ndim == 0:
+                values = values.reshape(1, 1)
+            elif values.ndim == 1:
+                values = values.reshape(-1, 1)
+            else:
+                values = values.reshape(values.shape[0], -1)
+            if values.shape[1] != 1:
+                continue
+
+            for step, value in zip(steps, values[:, 0], strict=True):
+                row = rows_by_step.setdefault(int(step), {"step": int(step), "time_fs": float(step) * timestep_fs})
+                row[key] = float(value)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=THERMO_COLUMNS)
+        writer.writeheader()
+        for step in sorted(rows_by_step):
+            row = {k: rows_by_step[step].get(k, math.nan) for k in THERMO_COLUMNS}
+            writer.writerow(row)
+
+
+def _load_flat_traj_for_analysis(ts, torchsim_h5: Path, flat_h5: Path, pressure_mpa: float, timestep_ps: float) -> dict[str, np.ndarray]:
+    def _frame_scalars(arr: np.ndarray, nframes: int) -> np.ndarray:
+        out = np.asarray(arr, dtype=float)
+        if out.ndim == 0:
+            out = np.full((nframes,), float(out), dtype=float)
+        elif out.ndim == 1:
+            if out.shape[0] == 1 and nframes > 1:
+                out = np.full((nframes,), float(out[0]), dtype=float)
+        else:
+            out = out.reshape(out.shape[0], -1)
+            if out.shape[1] == 1:
+                out = out[:, 0]
+            elif out.shape[0] == 1 and nframes > 1:
+                out = np.full((nframes,), float(out[0, 0]), dtype=float)
+            else:
+                out = out[:, 0]
+        return out
+
+    with ts.TorchSimTrajectory(str(torchsim_h5), mode="r") as traj:
+        nframes = len(traj)
+        if nframes <= 0:
+            raise RuntimeError(f"Empty trajectory generated at {torchsim_h5}")
+        steps = np.asarray(traj.get_steps("positions"), dtype=int)
+        positions = np.asarray(traj.get_array("positions"), dtype=float)
+        velocities = np.asarray(traj.get_array("velocities"), dtype=float) if "velocities" in traj.array_registry else np.zeros_like(positions)
+        forces = np.asarray(traj.get_array("forces"), dtype=float) if "forces" in traj.array_registry else np.zeros_like(positions)
+        cells = np.asarray(traj.get_array("cell"), dtype=float)
+        if cells.ndim == 2:
+            cells = np.repeat(cells[None, :, :], nframes, axis=0)
+        if cells.shape[0] == 1 and nframes > 1:
+            cells = np.repeat(cells, nframes, axis=0)
+
+        potential_energy = _frame_scalars(np.asarray(traj.get_array("potential_energy_eV"), dtype=float), nframes) if "potential_energy_eV" in traj.array_registry else np.zeros((nframes,), dtype=float)
+        kinetic_energy = _frame_scalars(np.asarray(traj.get_array("kinetic_energy_eV"), dtype=float), nframes) if "kinetic_energy_eV" in traj.array_registry else np.zeros((nframes,), dtype=float)
+        temperature = _frame_scalars(np.asarray(traj.get_array("temperature_K"), dtype=float), nframes) if "temperature_K" in traj.array_registry else np.zeros((nframes,), dtype=float)
+        volume = _frame_scalars(np.asarray(traj.get_array("volume_A3"), dtype=float), nframes) if "volume_A3" in traj.array_registry else np.abs(np.linalg.det(cells))
+
+        atoms0 = traj.get_atoms(0)
+        atomic_numbers = np.asarray(atoms0.get_atomic_numbers(), dtype=int)
+        masses = np.asarray(atoms0.get_masses(), dtype=float)
+        pbc = np.asarray(atoms0.pbc, dtype=bool)
+
+    density = _density_g_cm3(float(np.sum(masses)), volume)
+    time_ps = steps.astype(float) * float(timestep_ps)
+    pressure_mpa_series = np.full((len(steps),), float(pressure_mpa), dtype=float)
+    out = {
+        "atomic_numbers": atomic_numbers,
+        "masses": masses,
+        "positions": positions,
+        "velocities": velocities,
+        "forces": forces,
+        "cell": cells,
+        "pbc": pbc,
+        "step": steps,
+        "time_ps": time_ps,
+        "potential_energy": potential_energy,
+        "kinetic_energy": kinetic_energy,
+        "temperature": temperature,
+        "volume": volume,
+        "atom_potential_energy": None,
+        "density_g_cm3": density,
+        "pressure_MPa": pressure_mpa_series,
+    }
+    _write_h5md_flat(
+        flat_h5,
+        atomic_numbers=out["atomic_numbers"],
+        masses=out["masses"],
+        positions=out["positions"],
+        velocities=out["velocities"],
+        forces=out["forces"],
+        cells=out["cell"],
+        pbc=out["pbc"],
+        step=out["step"],
+        time_ps=out["time_ps"],
+        pe=out["potential_energy"],
+        ke=out["kinetic_energy"],
+        temp=out["temperature"],
+        vol=out["volume"],
+        atom_pe=out["atom_potential_energy"],
+    )
+    return out
+
+
+def _h5_last_step(ts, path: Path) -> int | None:
+    if not path.exists():
+        return None
+    with ts.TorchSimTrajectory(str(path), mode="r") as traj:
+        return traj.last_step
+
+
+def _load_resume_state(ts, path: Path, device, dtype):
+    import torch
+
+    with ts.TorchSimTrajectory(str(path), mode="r") as traj:
+        frame = len(traj) - 1
+        state = traj.get_state(frame=frame, device=device, dtype=dtype)
+        if "velocities" in traj.array_registry:
+            velocities = torch.tensor(traj.get_array("velocities", start=frame, stop=frame + 1)[0], device=device, dtype=dtype)
+            momenta = velocities * state.masses.unsqueeze(-1)
+            forces = torch.tensor(traj.get_array("forces", start=frame, stop=frame + 1)[0], device=device, dtype=dtype) if "forces" in traj.array_registry else torch.zeros_like(state.positions)
+            energy = torch.zeros((state.n_systems,), device=device, dtype=dtype)
+            return ts.MDState.from_state(state, momenta=momenta, energy=energy, forces=forces)
+        return state
+
+
+def _truncate_to_step(ts, files: list[Path], step: int) -> None:
+    rep = ts.TrajectoryReporter([str(p) for p in files], trajectory_kwargs={"mode": "a"})
+    rep.truncate_to_step(step)
+    rep.close()
+
+
+def _determine_resume_plan(ts, files: list[Path], n_steps_target: int, device, dtype):
+    existing = [p.exists() for p in files]
+    plan: dict[str, Any] = {
+        "resume_mode": False,
+        "reporter_mode": "w",
+        "resume_from_step": 0,
+        "steps_remaining": n_steps_target,
+        "completed": False,
+        "state": None,
+    }
+    if not any(existing):
+        return plan
+    if not all(existing):
+        raise RuntimeError("Resume requires either all cohort trajectories to exist or none")
+
+    steps = [_h5_last_step(ts, p) for p in files]
+    nonnull = [int(s) for s in steps if s is not None]
+    if not nonnull:
+        plan["resume_mode"] = True
+        plan["reporter_mode"] = "a"
+        return plan
+
+    common_last = min(nonnull)
+    if len(set(nonnull)) != 1:
+        _truncate_to_step(ts, files, common_last)
+
+    states = [_load_resume_state(ts, p, device=device, dtype=dtype) for p in files]
+    plan["resume_mode"] = True
+    plan["reporter_mode"] = "a"
+    plan["resume_from_step"] = common_last
+    plan["state"] = ts.concatenate_states(states)
+    plan["steps_remaining"] = max(0, int(n_steps_target) - common_last)
+    plan["completed"] = common_last >= int(n_steps_target)
+    return plan
+
+
+def _resolve_memory_scalers(ts, states, model, config: ScreenConfig):
+    if str(getattr(model, "device", "")) == "cpu":
+        return [float(len(s.atomic_numbers)) for s in states], None, "cpu_disabled"
+
+    metric_name = getattr(model, "memory_scales_with", "n_atoms")
+    try:
+        metrics = list(ts.calculate_memory_scalers(states, memory_scales_with=metric_name))
+    except Exception:
+        metrics = [float(len(s.atomic_numbers)) for s in states]
+
+    resolved = config.max_memory_scaler
+    source = "user_provided" if resolved is not None else "estimated"
+    if resolved is None:
+        try:
+            resolved = float(ts.estimate_max_memory_scaler(states, model, metrics))
+        except Exception:
+            source = "unavailable"
+            resolved = None
+    return metrics, resolved, source
+
+
+def _benchmark_counts(config: ScreenConfig, n_total: int) -> list[int]:
+    max_systems = config.benchmark_max_systems or n_total
+    max_systems = min(max_systems, n_total)
+    counts = list(range(1, max_systems + 1, max(1, config.benchmark_step_size)))
+    if counts and counts[-1] != max_systems:
+        counts.append(max_systems)
+    return counts
+
+
+def _save_benchmark_rows(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    if not rows:
+        return
+    rows = sorted(rows, key=lambda r: int(r["n_systems"]))
+    out_csv = out_dir / "batch_scaling.csv"
+    with out_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _benchmark_batch_scaling(ts, atoms_list: list[Atoms], model, config: ScreenConfig, *, device, dtype, seed: int, out_dir: Path, memory_scalers: list[float], resolved_max_memory_scaler: float | None, scaler_source: str) -> None:
+    counts = _benchmark_counts(config, len(atoms_list))
+    if not counts:
+        return
+    bench_dir = out_dir / "batch_benchmark"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+
+    for nsys in counts:
+        subset = atoms_list[:nsys]
+        states = [ts.initialize_state(at, device=device, dtype=dtype) for at in subset]
+        for idx, st in enumerate(states):
+            st.rng = int(seed + idx)
+        state = ts.concatenate_states(states)
+        state.rng = int(seed)
+
+        warm = ts.integrate(
+            system=state,
+            model=model,
+            integrator=ts.Integrator.nvt_langevin,
+            n_steps=config.benchmark_warmup_steps,
+            temperature=float(config.benchmark_temperature_k),
+            timestep=float(config.timestep_ps),
+            trajectory_reporter=None,
+            autobatcher=_build_autobatcher(ts, model, config, resolved_max_memory_scaler),
+            pbar=False,
+        )
+        t0 = time.perf_counter()
+        final = ts.integrate(
+            system=warm,
+            model=model,
+            integrator=ts.Integrator.nvt_langevin,
+            n_steps=config.benchmark_steps,
+            temperature=float(config.benchmark_temperature_k),
+            timestep=float(config.timestep_ps),
+            trajectory_reporter=None,
+            autobatcher=_build_autobatcher(ts, model, config, resolved_max_memory_scaler),
+            pbar=False,
+        )
+        elapsed = time.perf_counter() - t0
+        natoms = int(final.positions.shape[0])
+        atom_steps_per_s = (natoms * config.benchmark_steps) / max(elapsed, 1e-12)
+        scaler_total = float(sum(memory_scalers[:nsys])) if memory_scalers else math.nan
+        row = {
+            "n_systems": nsys,
+            "total_atoms": natoms,
+            "steps": int(config.benchmark_steps),
+            "elapsed_s": float(elapsed),
+            "atom_steps_per_s": float(atom_steps_per_s),
+            "memory_scaler_total": scaler_total,
+            "estimated_max_memory_scaler": resolved_max_memory_scaler if resolved_max_memory_scaler is not None else math.nan,
+            "max_memory_scaler_source": scaler_source,
+        }
+        rows.append(row)
+        _save_benchmark_rows(rows, bench_dir)
+
+
+def _tp_group_key(item: StructureItem, run_name: str) -> tuple[float, float | None, str]:
+    temp_k = float(item.temperature_C) + 273.15
+    pressure = float(item.pressure_MPa) if run_name == "retherm" else None
+    return (temp_k, pressure, item.task_name)
+
+
+def _trajectory_paths(rep_dir: Path, run_name: str) -> tuple[Path, Path, Path]:
+    ts_h5 = rep_dir / f"{run_name}.trajectory.h5"
+    flat_h5 = rep_dir / f"{run_name}.h5md"
+    thermo_csv = rep_dir / f"{run_name}_thermo.csv"
+    return ts_h5, flat_h5, thermo_csv
+
+
+def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str) -> None:
+    import torch
+    import torch_sim as ts
+
+    out_root = config.output_dir / "uma_torchsim_screen" / phase
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    device_name = _resolve_device(config.device)
+    device = torch.device(device_name)
+    dtype = _get_dtype(config)
+
+    model = load_fairchem_model(config.model_name, "omol" if phase == "electrolyte" else "omat", device_name, True)
+    initial_atoms = []
+    for item in items:
+        atoms = ase_read(item.structure_path)
+        atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
+        initial_atoms.append(atoms)
+
+    initial_states = [ts.initialize_state(at, device=device, dtype=dtype) for at in initial_atoms]
+    memory_scalers, resolved_max_memory_scaler, scaler_source = _resolve_memory_scalers(ts, initial_states, model, config)
+    run_config_path = out_root / "run_config.json"
+    _write_json_atomic(
+        run_config_path,
+        {
+            "phase": phase,
+            "model_name": config.model_name,
+            "device": device_name,
+            "precision": config.precision,
+            "resolved_max_memory_scaler": resolved_max_memory_scaler,
+            "max_memory_scaler_source": scaler_source,
+            "replicas": config.replicas,
+            "retherm_steps": config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode,
+            "prod_steps": config.prod_steps,
+            "dump_every_steps": config.dump_every_steps,
+            "timestep_ps": config.timestep_ps,
+            "benchmark_skipped": config.skip_batch_benchmark,
+        },
+    )
+
+    if not config.skip_batch_benchmark and device.type != "cpu":
+        _benchmark_batch_scaling(
+            ts,
+            initial_atoms,
+            model,
+            config,
+            device=device,
+            dtype=dtype,
+            seed=config.base_seed,
+            out_dir=out_root,
+            memory_scalers=memory_scalers,
+            resolved_max_memory_scaler=resolved_max_memory_scaler,
+            scaler_source=scaler_source,
+        )
+
+    retherm_steps = config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
     run_plan_steps: list[int] = []
-    for _item in items:
+    for _ in items:
         for _replica in range(config.replicas):
             run_plan_steps.extend([retherm_steps + 1, config.prod_steps + 1])
-
-    ema_tracker = _EmaRateTracker(alpha=0.30)
     completed_steps = 0
+    ema_tracker = _EmaRateTracker(alpha=0.30)
     global_bar = tqdm(total=len(run_plan_steps), desc=f"{phase} MD batches", unit="run")
 
-    for item_idx, item in enumerate(items):
-        for replica in range(config.replicas):
-            seed = config.base_seed + item_idx * 1000 + replica
-            rep_dir = out_root / item.condition_id / f"replica_{replica:03d}"
-            rep_dir.mkdir(parents=True, exist_ok=True)
-
+    for replica in range(config.replicas):
+        start_atoms_by_condition: dict[str, Atoms] = {}
+        for item_idx, item in enumerate(items):
             atoms = ase_read(item.structure_path)
             atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
-            temp_k = float(item.temperature_C) + 273.15
+            start_atoms_by_condition[item.condition_id] = atoms
 
-            retherm_summary: dict[str, float] | None = None
-            for run_name, nsteps in (("retherm", retherm_steps), ("prod", config.prod_steps)):
-                nsteps_total = nsteps + 1
+        for run_name, nsteps in (("retherm", retherm_steps), ("prod", config.prod_steps)):
+            grouped: dict[tuple[float, float | None, str], list[tuple[int, StructureItem]]] = {}
+            for item_idx, item in enumerate(items):
+                key = _tp_group_key(item, run_name)
+                grouped.setdefault(key, []).append((item_idx, item))
+
+            for group_key, cohort in grouped.items():
+                temp_k, pressure_mpa, task_name = group_key
+                phase_task_model = load_fairchem_model(config.model_name, task_name, device_name, True)
+
+                atoms_list: list[Atoms] = []
+                ts_files: list[Path] = []
+                flat_files: list[Path] = []
+                thermo_files: list[Path] = []
+                rep_dirs: list[Path] = []
+
+                for _item_idx, item in cohort:
+                    rep_dir = out_root / item.condition_id / f"replica_{replica:03d}"
+                    rep_dir.mkdir(parents=True, exist_ok=True)
+                    ts_h5, flat_h5, thermo_csv = _trajectory_paths(rep_dir, run_name)
+                    atoms_list.append(start_atoms_by_condition[item.condition_id].copy())
+                    ts_files.append(ts_h5)
+                    flat_files.append(flat_h5)
+                    thermo_files.append(thermo_csv)
+                    rep_dirs.append(rep_dir)
+
+                resume = _determine_resume_plan(ts, ts_files, nsteps, device, dtype)
                 remaining_all_steps = sum(run_plan_steps) - completed_steps
                 eta_total = ema_tracker.eta(remaining_all_steps)
                 if eta_total is None:
@@ -462,133 +785,128 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 else:
                     global_bar.set_postfix_str(f"ETA total: {_format_duration(eta_total)}")
 
-                run_desc = f"{item.condition_id} | rep {replica:03d} | {run_name}"
-                run_bar = tqdm(total=nsteps_total, desc=run_desc, unit="step", leave=False)
-                current_est = ema_tracker.eta(nsteps_total)
-                if current_est is not None:
-                    run_bar.set_postfix_str(f"ETA ~ {_format_duration(current_est)}")
+                if not resume["completed"]:
+                    if resume["resume_mode"]:
+                        batch_state = resume["state"]
+                    else:
+                        states = []
+                        for idx, atoms in enumerate(atoms_list):
+                            st = ts.initialize_state(atoms, device=device, dtype=dtype)
+                            st.rng = int(config.base_seed + replica * 100_000 + idx)
+                            states.append(st)
+                        batch_state = ts.concatenate_states(states)
+                        batch_state.rng = int(config.base_seed + replica)
 
-                last_progress = 0
-
-                def _on_progress(done_steps: int) -> None:
-                    nonlocal last_progress
-                    increment = max(0, int(done_steps) - int(last_progress))
-                    if increment > 0:
-                        run_bar.update(increment)
-                        last_progress += increment
-                    eta_current = ema_tracker.eta(max(0, nsteps_total - int(done_steps)))
-                    if eta_current is not None:
-                        run_bar.set_postfix_str(f"ETA ~ {_format_duration(eta_current)}")
-
-                t0 = time.perf_counter()
-                traj = _try_torchsim_md(
-                    atoms=atoms,
-                    nsteps=nsteps,
-                    save_every=config.dump_every_steps,
-                    timestep_ps=config.timestep_ps,
-                    model_name=config.model_name,
-                    task_name=item.task_name,
-                    device=device,
-                    compute_stress=config.compute_stress,
-                    seed=seed,
-                    ensemble="npt" if run_name == "retherm" else "nvt",
-                    pressure_MPa=float(item.pressure_MPa),
-                )
-                if traj is None:
-                    traj = _run_lightweight_md(
-                        atoms=atoms,
-                        nsteps=nsteps,
-                        save_every=config.dump_every_steps,
-                        timestep_ps=config.timestep_ps,
-                        seed=seed,
-                        target_temp_K=temp_k,
-                        ensemble="npt" if run_name == "retherm" else "nvt",
-                        progress_callback=_on_progress,
+                    rep = ts.TrajectoryReporter(
+                        filenames=[str(p) for p in ts_files],
+                        state_frequency=config.dump_every_steps,
+                        prop_calculators={config.dump_every_steps: _build_prop_calculators(ts)[1]},
+                        state_kwargs={
+                            "save_velocities": True,
+                            "save_forces": True,
+                            "variable_cell": run_name == "retherm",
+                            "variable_masses": False,
+                            "variable_atomic_numbers": False,
+                        },
+                        trajectory_kwargs={"mode": resume["reporter_mode"]},
                     )
-                else:
-                    # TorchSim integration is blocking; complete the per-run bar at the end.
-                    _on_progress(nsteps_total)
 
-                elapsed_s = time.perf_counter() - t0
-                ema_tracker.update(nsteps_total, elapsed_s)
-                run_bar.set_postfix_str(f"done in {_format_duration(elapsed_s)}")
-                run_bar.close()
-
-                _write_h5md_like(
-                    rep_dir / f"{run_name}.h5md",
-                    atomic_numbers=traj["atomic_numbers"],
-                    masses=traj["masses"],
-                    positions=traj["positions"],
-                    velocities=traj["velocities"],
-                    forces=traj["forces"],
-                    cells=traj["cell"],
-                    pbc=traj["pbc"],
-                    step=traj["step"],
-                    time_ps=traj["time_ps"],
-                    pe=traj["potential_energy"],
-                    ke=traj["kinetic_energy"],
-                    temp=traj["temperature"],
-                    vol=traj["volume"],
-                    atom_pe=traj["atom_potential_energy"],
-                )
-                density_series = _density_g_cm3(float(np.sum(traj["masses"])), traj["volume"])
-
-                if run_name == "retherm":
-                    eq_start_idx = _select_equilibrated_start_idx(density_series)
-                    eq_slice = slice(eq_start_idx, None)
-                    vol_eq = np.asarray(traj["volume"][eq_slice], dtype=float)
-                    den_eq = np.asarray(density_series[eq_slice], dtype=float)
-                    retherm_summary = {
-                        "equilibration_start_index": int(eq_start_idx),
-                        "equilibration_start_step": int(traj["step"][eq_start_idx]),
-                        "equilibration_start_time_ps": float(traj["time_ps"][eq_start_idx]),
-                        "equilibrated_volume_mean_A3": float(np.mean(vol_eq)),
-                        "equilibrated_volume_std_A3": float(np.std(vol_eq)),
-                        "equilibrated_density_mean_g_cm3": float(np.mean(den_eq)),
-                        "equilibrated_density_std_g_cm3": float(np.std(den_eq)),
+                    kwargs: dict[str, Any] = {
+                        "system": batch_state,
+                        "model": phase_task_model,
+                        "integrator": _pick_integrator(ts, "npt" if run_name == "retherm" else "nvt"),
+                        "n_steps": int(resume["steps_remaining"]),
+                        "temperature": float(temp_k),
+                        "timestep": float(config.timestep_ps),
+                        "trajectory_reporter": rep,
+                        "autobatcher": _build_autobatcher(ts, phase_task_model, config, resolved_max_memory_scaler),
+                        "pbar": False,
                     }
-                    (rep_dir / "retherm_equilibration.json").write_text(
-                        json.dumps(retherm_summary, indent=2),
-                        encoding="utf-8",
-                    )
-                    _write_thermo_csv(rep_dir / "retherm_thermo.csv", traj, float(item.pressure_MPa), density_series)
+                    if run_name == "retherm" and pressure_mpa is not None:
+                        kwargs["external_pressure"] = (float(pressure_mpa) / 101325.0) * EV_A3_PER_ATM
 
-                    # Start production from final retherm state, at averaged equilibrated volume.
-                    atoms.set_positions(np.asarray(traj["positions"][-1], dtype=float))
-                    atoms.set_cell(np.asarray(traj["cell"][-1], dtype=float), scale_atoms=False)
-                    if retherm_summary is not None:
-                        _set_atoms_volume_isotropic(atoms, retherm_summary["equilibrated_volume_mean_A3"])
+                    t0 = time.perf_counter()
+                    try:
+                        ts.integrate(**kwargs)
+                    finally:
+                        rep.close()
+                    elapsed = time.perf_counter() - t0
+                    ema_tracker.update(max(1, int(resume["steps_remaining"])), elapsed)
                 else:
-                    _write_thermo_csv(rep_dir / "prod_thermo.csv", traj, float(item.pressure_MPa), density_series)
+                    elapsed = 0.0
 
-                completed_steps += nsteps_total
-                global_bar.update(1)
+                for idx, (_item_idx, item) in enumerate(cohort):
+                    ts_h5 = ts_files[idx]
+                    flat_h5 = flat_files[idx]
+                    thermo_csv = thermo_files[idx]
+                    pressure_for_export = float(item.pressure_MPa) if run_name == "retherm" else float(item.pressure_MPa)
+                    traj = _load_flat_traj_for_analysis(ts, ts_h5, flat_h5, pressure_for_export, config.timestep_ps)
+                    _write_thermo_csv(thermo_csv, traj)
+                    _export_thermo_from_torchsim(ts, ts_h5, rep_dirs[idx] / f"{run_name}_thermo_detailed.csv", config.timestep_ps * 1000.0)
 
-            metadata = {
-                "condition_id": item.condition_id,
-                "phase": phase,
-                "task_name": item.task_name,
-                "structure_path": str(item.structure_path),
-                "temperature_C": item.temperature_C,
-                "pressure_MPa": item.pressure_MPa,
-                "liOH_M": item.liOH_M,
-                "kOH_M": item.kOH_M,
-                "lithiation_fraction": item.lithiation_fraction,
-                "vacancy_config_id": item.vacancy_config_id,
-                "charge": item.charge,
-                "spin": item.spin,
-                "n_li": item.n_li,
-                "seed": seed,
-                "device": device,
-                "ensemble_retherm": "npt",
-                "ensemble_production": "nvt",
-                "ensemble_requested": config.ensemble,
-                "timestep_ps": config.timestep_ps,
-                "dump_every_steps": config.dump_every_steps,
-            }
-            if retherm_summary is not None:
-                metadata["retherm_equilibration"] = retherm_summary
-            (rep_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    if run_name == "retherm":
+                        eq_start_idx = _select_equilibrated_start_idx(traj["density_g_cm3"])
+                        eq_slice = slice(eq_start_idx, None)
+                        vol_eq = np.asarray(traj["volume"][eq_slice], dtype=float)
+                        den_eq = np.asarray(traj["density_g_cm3"][eq_slice], dtype=float)
+                        retherm_summary = {
+                            "equilibration_start_index": int(eq_start_idx),
+                            "equilibration_start_step": int(traj["step"][eq_start_idx]),
+                            "equilibration_start_time_ps": float(traj["time_ps"][eq_start_idx]),
+                            "equilibrated_volume_mean_A3": float(np.mean(vol_eq)),
+                            "equilibrated_volume_std_A3": float(np.std(vol_eq)),
+                            "equilibrated_density_mean_g_cm3": float(np.mean(den_eq)),
+                            "equilibrated_density_std_g_cm3": float(np.std(den_eq)),
+                        }
+                        (rep_dirs[idx] / "retherm_equilibration.json").write_text(json.dumps(retherm_summary, indent=2), encoding="utf-8")
+
+                        atoms_next = atoms_list[idx].copy()
+                        atoms_next.set_positions(np.asarray(traj["positions"][-1], dtype=float))
+                        atoms_next.set_cell(np.asarray(traj["cell"][-1], dtype=float), scale_atoms=False)
+                        _set_atoms_volume_isotropic(atoms_next, float(retherm_summary["equilibrated_volume_mean_A3"]))
+                        start_atoms_by_condition[item.condition_id] = atoms_next
+
+                    metadata = {
+                        "condition_id": item.condition_id,
+                        "phase": phase,
+                        "task_name": item.task_name,
+                        "structure_path": str(item.structure_path),
+                        "temperature_C": item.temperature_C,
+                        "pressure_MPa": item.pressure_MPa,
+                        "liOH_M": item.liOH_M,
+                        "kOH_M": item.kOH_M,
+                        "lithiation_fraction": item.lithiation_fraction,
+                        "vacancy_config_id": item.vacancy_config_id,
+                        "charge": item.charge,
+                        "spin": item.spin,
+                        "n_li": item.n_li,
+                        "seed": int(config.base_seed + item_idx * 1000 + replica),
+                        "device": device_name,
+                        "ensemble_retherm": "npt",
+                        "ensemble_production": "nvt",
+                        "ensemble_requested": config.ensemble,
+                        "timestep_ps": config.timestep_ps,
+                        "dump_every_steps": config.dump_every_steps,
+                        "run_name": run_name,
+                        "batch_group_size": len(cohort),
+                        "batch_group_temperature_K": float(temp_k),
+                        "batch_group_pressure_MPa": pressure_mpa,
+                        "resume_used": bool(resume["resume_mode"]),
+                        "run_elapsed_s": float(elapsed),
+                        "torchsim_trajectory": str(ts_h5),
+                    }
+                    (rep_dirs[idx] / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+                completed_steps += (nsteps + 1)
+                global_bar.update(len(cohort))
+                _update_run_state(
+                    out_root / "run_state.json",
+                    phase=phase,
+                    replica=replica,
+                    run_name=run_name,
+                    batch_group_size=len(cohort),
+                    steps_completed_runs=int(global_bar.n),
+                )
 
     global_bar.set_postfix_str("completed")
     global_bar.close()

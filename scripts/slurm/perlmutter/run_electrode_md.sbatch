@@ -26,4 +26,7 @@ hrw-uma-torchsim-screen \
   --stage md \
   --electrode-manifest electrode_manifest.csv \
   --output-dir runs/uma_torchsim \
-  --device cuda
+  --device cuda \
+  --precision float32 \
+  --max-memory-scaler 12000 \
+  --skip-batch-benchmark

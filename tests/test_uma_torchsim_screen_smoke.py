@@ -19,7 +19,7 @@ def test_uma_torchsim_screen_smoke(tmp_path: Path, monkeypatch) -> None:
         "path/to/electrolyte.xyz", str(root / "default_structures/electrolyte_templates/H2O.cif")
     )
     ed_text = ed_manifest.read_text(encoding="utf-8").replace(
-        "path/to/electrode.cif", str(root / "default_structures/electrolyte_templates/Li.cif")
+        "path/to/electrode.cif", str(root / "default_structures/electrolyte_templates/H2O.cif")
     )
     ed_text = ed_text.replace("0.85", "1.0")
     el_manifest.write_text(el_text, encoding="utf-8")
