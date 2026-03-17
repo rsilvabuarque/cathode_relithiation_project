@@ -153,6 +153,96 @@ Analysis outputs:
     └── electrolyte_parallel_efficiency.png
 ```
 
+## Electrode post-generation VASP workflow (prepare → submit/status → UMA-vs-VASP analysis)
+
+New command:
+
+```bash
+hrw-electrode-vasp-workflow --help
+```
+
+Subcommands:
+
+- `prepare-inputs`: build per-structure SCF case folders from `best_training_set`
+- `submit`: submit pending (and optionally fizzled) cases via `sbatch`
+- `status`: classify `completed/running/fizzled/pending`
+- `analyze-uma-vs-vasp`: run UMA single-point checks on completed VASP outputs and generate lithiation-conditioned error plots
+
+### 1) Prepare VASP inputs
+
+Template-driven mode (uses provided `INCAR/KPOINTS/POTCAR`; applies composition-aware `MAGMOM` token substitution for `N_<Element>`):
+
+```bash
+hrw-electrode-vasp-workflow prepare-inputs \
+  --structures-root results/publication/default_systems/electrode/LCO_mp-22526/structure_generation \
+  --template-dir for_chat_gpt/VASP_input_templates_for_new_experiment \
+  --output-dir results/electrode_vasp_workflow
+```
+
+Auto mode with `MPStaticSet` (no template directory):
+
+```bash
+hrw-electrode-vasp-workflow prepare-inputs \
+  --structures-root results/publication/default_systems/electrode/LCO_mp-22526/structure_generation \
+  --output-dir results/electrode_vasp_workflow \
+  --potcar-spec
+```
+
+The command writes case folders under:
+
+```text
+<output_dir>/cases/<case_id>/
+  POSCAR INCAR KPOINTS [POTCAR|POTCAR.spec] run_vasp.slurm run_manifest.json
+```
+
+Per-case Slurm scripts default to Perlmutter settings and can be overridden by CLI flags (`--perlmutter-account`, `--perlmutter-queue`, `--slurm-*`, `--vasp-module`, `--vasp-exe`).
+
+### 2) Submit and monitor
+
+Submit pending jobs only:
+
+```bash
+hrw-electrode-vasp-workflow submit --cases-root results/electrode_vasp_workflow
+```
+
+Resubmit fizzled jobs as well:
+
+```bash
+hrw-electrode-vasp-workflow submit --cases-root results/electrode_vasp_workflow --resubmit-fizzled
+```
+
+Check status summary and optionally write JSON:
+
+```bash
+hrw-electrode-vasp-workflow status \
+  --cases-root results/electrode_vasp_workflow \
+  --output-json results/electrode_vasp_workflow/status_summary.json
+```
+
+### 3) Compare UMA vs VASP and plot vs lithiation
+
+```bash
+hrw-electrode-vasp-workflow analyze-uma-vs-vasp \
+  --cases-root results/electrode_vasp_workflow \
+  --analysis-dir results/electrode_vasp_workflow/analysis \
+  --model uma-s-1p2 \
+  --task-name omat
+```
+
+Analysis outputs include:
+
+```text
+<analysis_dir>/
+├── uma_vs_vasp_all_cases.csv
+├── analysis_summary.json
+├── uma_vs_vasp_delta_energy_per_atom_vs_lithiation.png
+├── uma_vs_vasp_mean_force_vs_lithiation.png
+├── uma_vs_vasp_rms_force_vs_lithiation.png
+└── per_case/*.json
+```
+
+The lithiation plots show all points with transparency plus mean±std overlays at each lithiation percentage.
+
 ## Electrode structure generation (scaffold)
 
 Inputs accepted by the scaffold:
