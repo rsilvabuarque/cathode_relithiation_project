@@ -37,6 +37,7 @@ hrw = "hydrorelith.cli:main"
 hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:main"
 hrw-electrolyte-generate = "hydrorelith.pipelines.electrolyte_structure_generation:main"
 hrw-scf-parallel-benchmark = "hydrorelith.pipelines.scf_parallelization_benchmark:main"
+hrw-electrode-vasp-workflow = "hydrorelith.pipelines.electrode_vasp_workflow:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
