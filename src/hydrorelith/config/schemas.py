@@ -22,7 +22,7 @@ class OutputConfig:
 @dataclass(slots=True)
 class SamplingConfig:
     max_structures: int = 600
-    oversampling_factor: int = 10
+    oversampling_factor: int = 5
     min_lithiation_fraction: float = 0.75
     lithiation_step: float = 0.05
     max_removal_combinations_per_fraction: int = 200

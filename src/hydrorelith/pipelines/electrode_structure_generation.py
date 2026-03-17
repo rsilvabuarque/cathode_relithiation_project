@@ -64,15 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-format", choices=["poscar", "cif"], default="poscar")
     parser.add_argument("--max-structures", type=int, default=600)
-    parser.add_argument("--oversampling-factor", type=int, default=10)
+    parser.add_argument("--oversampling-factor", type=int, default=5)
     parser.add_argument("--min-lithiation-fraction", type=float, default=0.75)
     parser.add_argument(
         "--lithiation-step",
         type=float,
         default=0.05,
         help=(
-            "Legacy bin step retained for bootstrap tree layout only. "
-            "Delithiation candidate generation now enumerates all discrete Li occupancies."
+            "Deprecated and ignored for delithiation candidate generation and bootstrap layout. "
+            "Discrete Li occupancies down to --min-lithiation-fraction are always enumerated."
         ),
     )
     parser.add_argument("--max-removal-combinations-per-fraction", type=int, default=200)
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--md-total-steps-budget",
         type=int,
         default=60000,
-        help="Total UMA/MatGL MD step budget distributed proportionally across MD runs.",
+        help="Total UMA/MatGL MD step budget distributed uniformly across MD runs.",
     )
     parser.add_argument("--md-sample-interval", type=int, default=10)
     parser.add_argument(
@@ -288,7 +288,9 @@ class ElectrodeStructureGenerationPipeline:
     def bootstrap_output_tree(self) -> None:
         self.prepare_output_layout()
         temperatures = list(self.config.temperature.values)
-        lithiation_fractions = self._build_lithiation_grid()
+        base_structure = self.load_pristine_structure()
+        total_ion_sites = self._count_target_ion_sites(base_structure)
+        lithiation_fractions = self._build_lithiation_grid(total_ion_sites)
         self._create_output_tree(
             temperatures=temperatures,
             lithiation_fractions=lithiation_fractions,
@@ -312,9 +314,6 @@ class ElectrodeStructureGenerationPipeline:
 
         if not (0.0 < self.config.sampling.min_lithiation_fraction <= 1.0):
             raise ValueError("--min-lithiation-fraction must be in (0, 1]")
-
-        if not (0.0 < self.config.sampling.lithiation_step < 1.0):
-            raise ValueError("--lithiation-step must be in (0, 1)")
 
         if self.config.sampling.max_removal_combinations_per_fraction <= 0:
             raise ValueError("--max-removal-combinations-per-fraction must be > 0")
@@ -374,15 +373,9 @@ class ElectrodeStructureGenerationPipeline:
     def prepare_output_layout(self) -> None:
         self.config.output.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _build_lithiation_grid(self) -> list[float]:
-        fractions = [1.0]
-        current = 1.0
-        while current - self.config.sampling.lithiation_step >= self.config.sampling.min_lithiation_fraction:
-            current = round(current - self.config.sampling.lithiation_step, 6)
-            fractions.append(current)
-        if fractions[-1] > self.config.sampling.min_lithiation_fraction:
-            fractions.append(round(self.config.sampling.min_lithiation_fraction, 6))
-        return fractions
+    def _build_lithiation_grid(self, total_ion_sites: int) -> list[float]:
+        targets = self._build_delithiation_targets(total_ion_sites=total_ion_sites)
+        return [float(actual_fraction) for _remove_count, actual_fraction in targets]
 
     def _create_output_tree(
         self,
@@ -1632,31 +1625,11 @@ class ElectrodeStructureGenerationPipeline:
         if not run_structure_targets:
             return []
         min_per_run = max(1, int(self.config.sampling.md_sample_interval))
-        min_total = min_per_run * len(run_structure_targets)
-        budget = max(min_total, int(self.config.sampling.md_total_steps_budget))
-        weights = [max(1, int(value)) for value in run_structure_targets]
-        allocations = [min_per_run for _ in run_structure_targets]
-        remaining = budget - min_total
-        if remaining <= 0:
-            return allocations
-
-        total_weight = float(sum(weights))
-        raw_extra = [remaining * (w / total_weight) for w in weights]
-        floor_extra = [int(math.floor(v)) for v in raw_extra]
-        for idx, extra in enumerate(floor_extra):
-            allocations[idx] += extra
-
-        assigned = sum(floor_extra)
-        leftovers = remaining - assigned
-        if leftovers > 0:
-            frac_order = sorted(
-                range(len(weights)),
-                key=lambda i: (raw_extra[i] - floor_extra[i]),
-                reverse=True,
-            )
-            for i in frac_order[:leftovers]:
-                allocations[i] += 1
-        return allocations
+        n_runs = len(run_structure_targets)
+        budget = max(min_per_run * n_runs, int(self.config.sampling.md_total_steps_budget))
+        steps_per_run = int(math.ceil(budget / max(n_runs, 1)))
+        steps_per_run = max(min_per_run, steps_per_run)
+        return [steps_per_run for _ in run_structure_targets]
 
     def _select_even_snapshots(self, snapshots, n_keep: int, seed: int):
         if n_keep <= 0 or not snapshots:
@@ -1884,7 +1857,7 @@ class ElectrodeStructureGenerationPipeline:
                         f"--mpid {self.config.source.mpid} --target-ion {self.config.source.target_ion} "
                         f"--output-dir {self.config.output.output_dir} --output-format {self.config.output.output_format} "
                         f"--max-structures {self.config.sampling.max_structures} --oversampling-factor {self.config.sampling.oversampling_factor} "
-                        f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
+                        f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} "
                         f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                         f"--rattle-engine {engine} --md-execution run --skip-direct "
                         f"--md-frame-select-fraction {self.config.sampling.md_frame_select_fraction} "
@@ -1903,7 +1876,7 @@ class ElectrodeStructureGenerationPipeline:
                     f"--mpid {self.config.source.mpid} --target-ion {self.config.source.target_ion} "
                     f"--output-dir {self.config.output.output_dir} --output-format {self.config.output.output_format} "
                     f"--max-structures {self.config.sampling.max_structures} --oversampling-factor {self.config.sampling.oversampling_factor} "
-                    f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} --lithiation-step {self.config.sampling.lithiation_step} "
+                    f"--min-lithiation-fraction {self.config.sampling.min_lithiation_fraction} "
                     f"--max-removal-combinations-per-fraction {self.config.sampling.max_removal_combinations_per_fraction} "
                     f"--rattle-engine {engine} --md-execution run --skip-direct "
                     f"--md-frame-select-fraction {self.config.sampling.md_frame_select_fraction} "
