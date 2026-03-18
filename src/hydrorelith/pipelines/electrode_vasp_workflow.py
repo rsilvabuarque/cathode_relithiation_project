@@ -65,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--cases-root", type=Path, required=True)
     status.add_argument("--user", type=str, default=None)
     status.add_argument("--output-json", type=Path, default=None)
+    status.add_argument(
+        "--list-states",
+        nargs="+",
+        choices=["completed", "running", "fizzled", "pending"],
+        default=[],
+        help="Print case directories for the requested states.",
+    )
 
     analyze = subparsers.add_parser("analyze-uma-vs-vasp", help="Batch UMA-vs-VASP comparison and lithiation-dependent plots.")
     analyze.add_argument("--cases-root", type=Path, required=True)
@@ -445,9 +452,21 @@ def cmd_status(args: argparse.Namespace) -> None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary["counts"], indent=2))
-    if summary["fizzled_cases"]:
-        print("Fizzled case directories:")
-        for path in summary["fizzled_cases"]:
+
+    state_key_map = {
+        "completed": "completed_cases",
+        "running": "running_cases",
+        "fizzled": "fizzled_cases",
+        "pending": "pending_cases",
+    }
+    requested_states = list(dict.fromkeys(args.list_states))
+    if not requested_states and summary["fizzled_cases"]:
+        requested_states = ["fizzled"]
+
+    for state in requested_states:
+        case_paths = summary[state_key_map[state]]
+        print(f"{state.capitalize()} case directories ({len(case_paths)}):")
+        for path in case_paths:
             print(path)
 
 
