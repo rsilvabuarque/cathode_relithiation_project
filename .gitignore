@@ -12,4 +12,5 @@ dist/
 .DS_Store
 
 for_chat_gpt/
+results/
 results/dry_run_engine_all_*/
