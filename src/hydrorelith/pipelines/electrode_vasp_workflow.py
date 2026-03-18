@@ -481,7 +481,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
             submitted += 1
             continue
 
-        proc = subprocess.run(["sbatch", str(script)], cwd=str(case_dir), capture_output=True, text=True, check=False)
+        proc = subprocess.run(["sbatch", script.name], cwd=str(case_dir), capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             print(f"[submit-error] {case_dir}: {proc.stderr.strip()}")
             continue
