@@ -61,14 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--resubmit-fizzled", action="store_true")
     submit.add_argument("--dry-run", action="store_true")
 
-    status = subparsers.add_parser("status", help="Report completed/running/fizzled/pending VASP jobs.")
+    status = subparsers.add_parser("status", help="Report completed/running/unconverged/fizzled/pending VASP jobs.")
     status.add_argument("--cases-root", type=Path, required=True)
     status.add_argument("--user", type=str, default=None)
     status.add_argument("--output-json", type=Path, default=None)
     status.add_argument(
         "--list-states",
         nargs="+",
-        choices=["completed", "running", "fizzled", "pending"],
+        choices=["completed", "running", "unconverged", "fizzled", "pending"],
         default=[],
         help="Print case directories for the requested states.",
     )
@@ -400,6 +400,49 @@ def _is_completed(case_dir: Path) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _read_nelm_from_incar(case_dir: Path) -> int | None:
+    incar_path = case_dir / "INCAR"
+    if not incar_path.exists():
+        return None
+    try:
+        text = incar_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].split("!", 1)[0].strip()
+        if not line:
+            continue
+        match = re.match(r"^\s*NELM\s*=\s*([0-9]+)", line, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _last_electronic_iteration_from_outcar(case_dir: Path) -> int | None:
+    outcar_path = case_dir / "OUTCAR"
+    if not outcar_path.exists():
+        return None
+    text = _tail_text(outcar_path, max_bytes=512_000)
+    if not text:
+        return None
+
+    matches = re.findall(r"Iteration\s+\d+\(\s*(\d+)\)", text)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def _is_unconverged(case_dir: Path) -> bool:
+    nelm = _read_nelm_from_incar(case_dir)
+    if nelm is None:
+        return False
+    last_iter = _last_electronic_iteration_from_outcar(case_dir)
+    if last_iter is None:
+        return False
+    return last_iter >= nelm
+
+
 def _has_runtime_outputs(case_dir: Path) -> bool:
     candidates = ["OUTCAR", "OSZICAR", "vasprun.xml"]
     if any((case_dir / name).exists() for name in candidates):
@@ -411,12 +454,14 @@ def _has_runtime_outputs(case_dir: Path) -> bool:
 
 def _case_status(case_dir: Path, active_jobs: set[str], user: str) -> str:
     del user
-    if _is_completed(case_dir):
-        return "completed"
     manifest = _read_manifest(case_dir)
     ids = _extract_job_ids(case_dir, manifest)
     if ids & active_jobs:
         return "running"
+    if _is_unconverged(case_dir):
+        return "unconverged"
+    if _is_completed(case_dir):
+        return "completed"
     if _has_runtime_outputs(case_dir):
         return "fizzled"
     return "pending"
@@ -434,6 +479,7 @@ def _summarize_status(cases_root: Path, user: str) -> dict[str, object]:
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "cases_root": str(cases_root),
         "counts": {key: len(value) for key, value in by_state.items()},
+        "unconverged_cases": sorted(by_state.get("unconverged", [])),
         "fizzled_cases": sorted(by_state.get("fizzled", [])),
         "running_cases": sorted(by_state.get("running", [])),
         "completed_cases": sorted(by_state.get("completed", [])),
@@ -456,6 +502,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     state_key_map = {
         "completed": "completed_cases",
         "running": "running_cases",
+        "unconverged": "unconverged_cases",
         "fizzled": "fizzled_cases",
         "pending": "pending_cases",
     }
