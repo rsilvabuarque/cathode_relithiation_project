@@ -17,7 +17,7 @@ dependencies = [
   "ase",
   "pymatgen",
   "hiphive",
-  "fairchem-core>=2.15.0,<3",
+  "fairchem-core[dev] @ git+https://github.com/facebookresearch/fairchem.git@main#subdirectory=packages/fairchem-core",
   "torch-sim-atomistic",
   "matgl>=2.0.0",
   "torch~=2.8.0",
@@ -43,6 +43,7 @@ hrw-uma-torchsim-screen = "hydrorelith.pipelines.uma_torchsim_screen:main"
 hrw-uma-torchsim-analyze = "hydrorelith.pipelines.uma_torchsim_screen:main_analyze"
 hrw-uma-torchsim-export2pt = "hydrorelith.pipelines.uma_torchsim_screen:main_export2pt"
 hrw-uma-torchsim-manifest-template = "hydrorelith.io.structure_manifest:main_template"
+hrw-uma-finetune-vasp-workflow = "hydrorelith.pipelines.uma_finetune_vasp_workflow:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

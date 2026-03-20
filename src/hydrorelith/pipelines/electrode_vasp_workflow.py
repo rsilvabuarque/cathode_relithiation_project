@@ -55,10 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--vasp-exe", type=str, default="vasp_std")
     prepare.add_argument("--job-name-prefix", type=str, default="vasp_scf")
 
-    submit = subparsers.add_parser("submit", help="Submit pending/fizzled VASP jobs in prepared case directories.")
+    submit = subparsers.add_parser("submit", help="Submit pending VASP jobs (optionally resubmitting fizzled/unconverged) in prepared case directories.")
     submit.add_argument("--cases-root", type=Path, required=True, help="Path to workflow output root or directly to cases/.")
     submit.add_argument("--user", type=str, default=None)
     submit.add_argument("--resubmit-fizzled", action="store_true")
+    submit.add_argument("--resubmit-unconverged", action="store_true")
     submit.add_argument("--dry-run", action="store_true")
 
     status = subparsers.add_parser("status", help="Report completed/running/unconverged/fizzled/pending VASP jobs.")
@@ -531,6 +532,9 @@ def cmd_submit(args: argparse.Namespace) -> None:
     for case_dir in case_dirs:
         state = _case_status(case_dir, active_jobs, user)
         if state in {"completed", "running"}:
+            skipped += 1
+            continue
+        if state == "unconverged" and not args.resubmit_unconverged:
             skipped += 1
             continue
         if state == "fizzled" and not args.resubmit_fizzled:

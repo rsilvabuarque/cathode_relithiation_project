@@ -243,6 +243,66 @@ Analysis outputs include:
 
 The lithiation plots show all points with transparency plus mean±std overlays at each lithiation percentage.
 
+## UMA fine-tuning from `vasp_workflow` outputs (omat)
+
+New command:
+
+```bash
+hrw-uma-finetune-vasp-workflow --help
+```
+
+Purpose:
+
+- Convert completed VASP cases into labeled `extxyz` files.
+- Build a reproducible `90/5/5` train/val/test split.
+- Preserve diversity across temperatures and de-lithiation values parsed from case directory names (`T_<K>`, `lith_<pct>`).
+- Run official FAIRChem UMA fine-tuning tooling for `omat`.
+- Compare pre/post-fine-tuning MLFF quality against VASP labels.
+
+Recommended references:
+
+- https://fair-chem.github.io/
+- https://fair-chem.github.io/fine-tuning/
+
+Required FAIRChem install for fine-tuning (official docs):
+
+```bash
+git clone https://github.com/facebookresearch/fairchem.git
+pip install -e fairchem/packages/fairchem-core[dev]
+```
+
+If your shell aliases `fairchem`, invoke the binary directly from your active env:
+
+```bash
+$(dirname $(which python))/fairchem -c <generated_yaml>
+```
+
+Quick workflow:
+
+```bash
+# 1) Prepare split dataset
+hrw-uma-finetune-vasp-workflow prepare-dataset \
+  --cases-root results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/vasp_workflow \
+  --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/dataset
+
+# 2) Fine-tune UMA
+hrw-uma-finetune-vasp-workflow run-finetune \
+  --dataset-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/dataset \
+  --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/finetune \
+  --uma-task omat --regression-tasks ef --base-model uma-s-1p2
+
+# 3) Pre/post analysis on test split
+hrw-uma-finetune-vasp-workflow analyze-pre-post \
+  --dataset-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/dataset \
+  --fine-tuned-checkpoint <path_to_inference_ckpt.pt> \
+  --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/analysis \
+  --task-name omat --split test
+```
+
+Full details and end-to-end examples are in:
+
+- `docs/uma_finetune_vasp_workflow.md`
+
 ## Electrode structure generation (scaffold)
 
 Inputs accepted by the scaffold:
