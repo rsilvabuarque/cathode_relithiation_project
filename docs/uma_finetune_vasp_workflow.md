@@ -142,7 +142,8 @@ hrw-uma-finetune-vasp-workflow analyze-pre-post \
   --output-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/analysis \
   --base-model uma-s-1p2 \
   --task-name omat \
-  --split test
+  --split test \
+  --training-log <path_to_training_log>
 ```
 
 Key metrics reported for both pre/post models:
@@ -162,6 +163,47 @@ Outputs:
   pre_post_energy_per_atom_vs_delithiation.png
   pre_post_mean_force_vs_delithiation.png
   pre_post_rms_force_vs_delithiation.png
+  parity_energy_baseline_vs_vasp.png
+  parity_energy_finetuned_vs_vasp.png
+  parity_force_mean_abs_baseline_vs_vasp.png
+  parity_force_mean_abs_finetuned_vs_vasp.png
+  train_loss_vs_step.png                 # if --training-log is provided
+  val_loss_vs_step.png                   # if --training-log contains val/loss lines
+  training_history_parsed.csv            # parsed train/val loss history
+```
+
+## 4) Periodic checkpoint monitoring during training
+
+Use this when training is still running and checkpoints are being written/synced.
+
+```bash
+hrw-uma-finetune-vasp-workflow analyze-checkpoints \
+  --dataset-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/launch_full_completed_20260320_032818/dataset_completed_only_strict_v3 \
+  --run-dir results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/launch_full_completed_20260320_032818/finetune_full_completed_gpu_20260320_041048_job50282412/runs \
+  --output-root results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow/live_checkpoint_analysis \
+  --latest-only \
+  --split val \
+  --device cuda \
+  --training-log uma_full_completed_50282412.out
+```
+
+This writes one analysis directory per checkpoint under `--output-root` and updates:
+
+- `checkpoint_analysis_index.json`
+
+For periodic checks from login node, run e.g. every 10 minutes:
+
+```bash
+while true; do
+  hrw-uma-finetune-vasp-workflow analyze-checkpoints \
+    --dataset-dir <dataset_dir> \
+    --run-dir <run_dir> \
+    --output-root <live_analysis_dir> \
+    --latest-only \
+    --split val \
+    --training-log <slurm_or_pipeline_log>
+  sleep 600
+done
 ```
 
 ## One-command end-to-end run
