@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import math
@@ -55,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--seed", type=int, default=7)
     prepare.add_argument("--max-cases", type=int, default=None)
     prepare.add_argument(
+        "--case-list",
+        type=Path,
+        default=None,
+        help="Optional text file with one case directory path per line; when provided, only these cases are included.",
+    )
+    prepare.add_argument(
         "--require-completed",
         action="store_true",
         default=True,
@@ -96,6 +103,33 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     analyze.add_argument("--split", choices=["train", "val", "test", "all"], default="test")
     analyze.add_argument("--max-cases", type=int, default=None)
+    analyze.add_argument(
+        "--training-log",
+        type=Path,
+        default=None,
+        help="Optional fairchem/slurm log file to parse training/validation loss vs step.",
+    )
+
+    analyze_ckpt = subparsers.add_parser(
+        "analyze-checkpoints",
+        help="Analyze one or more checkpoints from a run directory for periodic monitoring.",
+    )
+    analyze_ckpt.add_argument("--dataset-dir", type=Path, required=True)
+    analyze_ckpt.add_argument("--run-dir", type=Path, required=True, help="Directory containing run subdirs with checkpoints.")
+    analyze_ckpt.add_argument("--output-root", type=Path, required=True, help="Root directory to write checkpoint-wise analyses.")
+    analyze_ckpt.add_argument("--base-model", type=str, default="uma-s-1p2")
+    analyze_ckpt.add_argument("--task-name", type=str, default="omat")
+    analyze_ckpt.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    analyze_ckpt.add_argument("--split", choices=["train", "val", "test", "all"], default="test")
+    analyze_ckpt.add_argument("--max-cases", type=int, default=None)
+    analyze_ckpt.add_argument("--latest-only", action="store_true", help="Only analyze the newest checkpoint.")
+    analyze_ckpt.add_argument("--max-checkpoints", type=int, default=None, help="If set, only analyze the newest N checkpoints.")
+    analyze_ckpt.add_argument(
+        "--training-log",
+        type=Path,
+        default=None,
+        help="Optional fairchem/slurm log file to parse training/validation loss vs step.",
+    )
 
     all_cmd = subparsers.add_parser(
         "run-all",
@@ -440,6 +474,16 @@ def cmd_prepare_dataset(args: argparse.Namespace) -> None:
 
     cases_root = _resolve_cases_root(args.cases_root)
     case_dirs = _discover_case_dirs(cases_root)
+
+    if args.case_list is not None:
+        lines = args.case_list.read_text(encoding="utf-8").splitlines()
+        allowed = {
+            str(Path(line.strip()).resolve())
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        }
+        case_dirs = [case_dir for case_dir in case_dirs if str(case_dir.resolve()) in allowed]
+
     if args.max_cases is not None:
         case_dirs = case_dirs[: max(0, int(args.max_cases))]
 
@@ -697,10 +741,25 @@ def _metric_summary(rows: list[dict[str, object]]) -> dict[str, float]:
 
     return {
         "energy_mae_eV": _mae("delta_energy_eV"),
+        "energy_rmse_eV": float(
+            np.sqrt(np.mean(np.square(np.array([float(r["delta_energy_eV"]) for r in rows], dtype=float))))
+        ),
         "energy_per_atom_mae_eV": _mae("delta_energy_per_atom_eV"),
+        "energy_per_atom_rmse_eV": float(
+            np.sqrt(np.mean(np.square(np.array([float(r["delta_energy_per_atom_eV"]) for r in rows], dtype=float))))
+        ),
         "mean_force_difference_mae_eV_per_A": _mae("mean_force_difference_eV_per_A"),
+        "mean_force_difference_rmse_eV_per_A": float(
+            np.sqrt(np.mean(np.square(np.array([float(r["mean_force_difference_eV_per_A"]) for r in rows], dtype=float))))
+        ),
         "rms_force_difference_mae_eV_per_A": _mae("rms_force_difference_eV_per_A"),
+        "rms_force_difference_rmse_eV_per_A": float(
+            np.sqrt(np.mean(np.square(np.array([float(r["rms_force_difference_eV_per_A"]) for r in rows], dtype=float))))
+        ),
         "max_force_difference_mae_eV_per_A": _mae("max_force_difference_eV_per_A"),
+        "max_force_difference_rmse_eV_per_A": float(
+            np.sqrt(np.mean(np.square(np.array([float(r["max_force_difference_eV_per_A"]) for r in rows], dtype=float))))
+        ),
     }
 
 
@@ -726,6 +785,9 @@ def _compare_records(
 
         ft_energy, ft_forces = _predict_with_calc(ft_calc, atoms)
         ft_mean_df, ft_rms_df, ft_max_df = _force_metrics(vasp_forces, ft_forces)
+        vasp_mean_force_abs = float(np.mean(np.linalg.norm(vasp_forces, axis=1)))
+        base_mean_force_abs = float(np.mean(np.linalg.norm(base_forces, axis=1)))
+        ft_mean_force_abs = float(np.mean(np.linalg.norm(ft_forces, axis=1)))
 
         out.append(
             {
@@ -743,6 +805,9 @@ def _compare_records(
                 "ft_delta_energy_eV": ft_energy - vasp_energy,
                 "base_delta_energy_per_atom_eV": (base_energy - vasp_energy) / max(1, natoms),
                 "ft_delta_energy_per_atom_eV": (ft_energy - vasp_energy) / max(1, natoms),
+                "vasp_mean_force_abs_eV_per_A": vasp_mean_force_abs,
+                "base_mean_force_abs_eV_per_A": base_mean_force_abs,
+                "ft_mean_force_abs_eV_per_A": ft_mean_force_abs,
                 "base_mean_force_difference_eV_per_A": base_mean_df,
                 "ft_mean_force_difference_eV_per_A": ft_mean_df,
                 "base_rms_force_difference_eV_per_A": base_rms_df,
@@ -783,7 +848,39 @@ def _compare_records(
     return out, {"baseline": base_metrics, "finetuned": ft_metrics, "improvement": improvement}
 
 
-def _write_analysis_plots(rows: list[dict[str, object]], out_dir: Path) -> None:
+def _parse_training_history(log_path: Path) -> list[dict[str, float]]:
+    if not log_path.exists():
+        return []
+
+    rows: list[dict[str, float]] = []
+    current_step: float | None = None
+    train_pattern = re.compile(r"\{.*'train/loss'.*\}")
+    val_pattern = re.compile(r"val/loss:\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)")
+
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m_train = train_pattern.search(line)
+        if m_train:
+            try:
+                payload = ast.literal_eval(m_train.group(0))
+                step = float(payload.get("train/step"))
+                loss = float(payload.get("train/loss"))
+                current_step = step
+                rows.append({"step": step, "train_loss": loss})
+            except Exception:
+                pass
+            continue
+
+        m_val = val_pattern.search(line)
+        if m_val and current_step is not None:
+            try:
+                rows.append({"step": float(current_step), "val_loss": float(m_val.group(1))})
+            except Exception:
+                pass
+
+    return rows
+
+
+def _write_analysis_plots(rows: list[dict[str, object]], out_dir: Path, training_log: Path | None = None) -> None:
     if not rows:
         return
 
@@ -839,6 +936,220 @@ def _write_analysis_plots(rows: list[dict[str, object]], out_dir: Path) -> None:
         plt.tight_layout()
         plt.savefig(out_dir / f"pre_post_{name}_vs_{suffix}.png", dpi=220)
         plt.close()
+
+    def _write_parity_plot(xvals: np.ndarray, yvals: np.ndarray, title: str, xlabel: str, ylabel: str, filename: str) -> None:
+        mask = np.isfinite(xvals) & np.isfinite(yvals)
+        if not np.any(mask):
+            return
+        x_use = xvals[mask]
+        y_use = yvals[mask]
+        residual = y_use - x_use
+        rmse = float(np.sqrt(np.mean(np.square(residual))))
+        ss_tot = float(np.sum(np.square(x_use - np.mean(x_use))))
+        ss_res = float(np.sum(np.square(residual)))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0.0 else float("nan")
+        lo = float(min(np.min(x_use), np.min(y_use)))
+        hi = float(max(np.max(x_use), np.max(y_use)))
+        pad = max(1e-8, 0.03 * (hi - lo if hi > lo else 1.0))
+
+        plt.figure(figsize=(6.5, 6.0))
+        plt.scatter(x_use, y_use, s=16, alpha=0.3)
+        plt.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", linewidth=1.0)
+        plt.xlim(lo - pad, hi + pad)
+        plt.ylim(lo - pad, hi + pad)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        metric_text = f"RMSE = {rmse:.4f}\\nR² = {r2:.4f}" if np.isfinite(r2) else f"RMSE = {rmse:.4f}\\nR² = n/a"
+        plt.text(
+            0.03,
+            0.97,
+            metric_text,
+            transform=plt.gca().transAxes,
+            va="top",
+            ha="left",
+            fontsize=10,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+        )
+        plt.grid(alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(out_dir / filename, dpi=220)
+        plt.close()
+
+    vasp_e = np.array([float(r["vasp_energy_eV"]) for r in rows], dtype=float)
+    base_e = np.array([float(r["base_energy_eV"]) for r in rows], dtype=float)
+    ft_e = np.array([float(r["ft_energy_eV"]) for r in rows], dtype=float)
+    _write_parity_plot(
+        vasp_e,
+        base_e,
+        title="Parity: Baseline energy vs VASP",
+        xlabel="VASP energy (eV)",
+        ylabel="Baseline UMA energy (eV)",
+        filename="parity_energy_baseline_vs_vasp.png",
+    )
+    _write_parity_plot(
+        vasp_e,
+        ft_e,
+        title="Parity: Fine-tuned energy vs VASP",
+        xlabel="VASP energy (eV)",
+        ylabel="Fine-tuned UMA energy (eV)",
+        filename="parity_energy_finetuned_vs_vasp.png",
+    )
+
+    vasp_f = np.array([float(r["vasp_mean_force_abs_eV_per_A"]) for r in rows], dtype=float)
+    base_f = np.array([float(r["base_mean_force_abs_eV_per_A"]) for r in rows], dtype=float)
+    ft_f = np.array([float(r["ft_mean_force_abs_eV_per_A"]) for r in rows], dtype=float)
+    _write_parity_plot(
+        vasp_f,
+        base_f,
+        title="Parity: Baseline mean|F| vs VASP",
+        xlabel="VASP mean |F| (eV/Å)",
+        ylabel="Baseline UMA mean |F| (eV/Å)",
+        filename="parity_force_mean_abs_baseline_vs_vasp.png",
+    )
+    _write_parity_plot(
+        vasp_f,
+        ft_f,
+        title="Parity: Fine-tuned mean|F| vs VASP",
+        xlabel="VASP mean |F| (eV/Å)",
+        ylabel="Fine-tuned UMA mean |F| (eV/Å)",
+        filename="parity_force_mean_abs_finetuned_vs_vasp.png",
+    )
+
+    if training_log is not None:
+        hist = _parse_training_history(training_log)
+        if hist:
+            hist_csv = out_dir / "training_history_parsed.csv"
+            fields = sorted({k for row in hist for k in row.keys()})
+            with hist_csv.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for row in hist:
+                    writer.writerow(row)
+
+            def _loss_filter_start(losses_in: np.ndarray) -> int:
+                npts = int(losses_in.size)
+                if npts <= 5:
+                    return 0
+                warmup_min = max(3, int(0.02 * npts))
+                high_loss_threshold = float(np.quantile(losses_in, 0.9))
+                below = np.where(losses_in[warmup_min:] <= high_loss_threshold)[0]
+                if below.size == 0:
+                    return warmup_min
+                return int(warmup_min + below[0])
+
+            def _convergence_assessment(steps_in: np.ndarray, losses_in: np.ndarray) -> tuple[float, float, float, str]:
+                npts = int(losses_in.size)
+                if npts < 4:
+                    return float("nan"), float("nan"), float("nan"), "Insufficient points"
+
+                tail_n = max(4, int(0.2 * npts))
+                tail_x = steps_in[-tail_n:]
+                tail_y = losses_in[-tail_n:]
+                if float(np.ptp(tail_x)) <= 0.0:
+                    slope = 0.0
+                else:
+                    slope = float(np.polyfit(tail_x, tail_y, 1)[0])
+                slope_per_1k = 1000.0 * slope
+                rel_tail_change = float((tail_y[0] - tail_y[-1]) / max(abs(float(tail_y[0])), 1e-12))
+                tail_cv = float(np.std(tail_y) / max(abs(float(np.mean(tail_y))), 1e-12))
+
+                if slope_per_1k < -0.01 and rel_tail_change > 0.03:
+                    assessment = "Still improving; longer run may help"
+                elif abs(slope_per_1k) <= 0.01 and abs(rel_tail_change) <= 0.03:
+                    assessment = "Near plateau; likely converged"
+                else:
+                    assessment = "Noisy/slow improvement"
+                return slope_per_1k, rel_tail_change, tail_cv, assessment
+
+            def _write_loss_dual_plot(
+                steps_in: np.ndarray,
+                losses_in: np.ndarray,
+                title: str,
+                xlabel: str,
+                ylabel: str,
+                filename: str,
+                marker: str | None = None,
+            ) -> None:
+                mask = np.isfinite(steps_in) & np.isfinite(losses_in)
+                if not np.any(mask):
+                    return
+
+                steps_use = steps_in[mask]
+                losses_use = losses_in[mask]
+                cutoff_idx = _loss_filter_start(losses_use)
+                steps_f = steps_use[cutoff_idx:]
+                losses_f = losses_use[cutoff_idx:]
+
+                slope_per_1k, rel_tail_change, tail_cv, assessment = _convergence_assessment(steps_f, losses_f)
+
+                fig, axes = plt.subplots(2, 1, figsize=(8.5, 8.5))
+
+                if marker is None:
+                    axes[0].plot(steps_use, losses_use, linewidth=1.4)
+                    axes[1].plot(steps_f, losses_f, linewidth=1.4)
+                else:
+                    axes[0].plot(steps_use, losses_use, marker=marker, linewidth=1.1)
+                    axes[1].plot(steps_f, losses_f, marker=marker, linewidth=1.1)
+
+                axes[0].axvline(float(steps_use[cutoff_idx]), color="k", linestyle="--", linewidth=1.0, alpha=0.6)
+                axes[0].set_title(f"{title} (full)")
+                axes[0].set_xlabel(xlabel)
+                axes[0].set_ylabel(ylabel)
+                axes[0].grid(alpha=0.2)
+
+                axes[1].set_title(f"{title} (filtered after warmup)")
+                axes[1].set_xlabel(xlabel)
+                axes[1].set_ylabel(ylabel)
+                axes[1].grid(alpha=0.2)
+
+                metrics_text = (
+                    f"Tail slope: {slope_per_1k:.4f} loss/1k steps\\n"
+                    f"Tail Δloss: {100.0 * rel_tail_change:.2f}%\\n"
+                    f"Tail CV: {tail_cv:.3f}\\n"
+                    f"Assessment: {assessment}"
+                )
+                axes[1].text(
+                    0.02,
+                    0.98,
+                    metrics_text,
+                    transform=axes[1].transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=9,
+                    bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.82, "edgecolor": "0.7"},
+                )
+
+                fig.tight_layout()
+                fig.savefig(out_dir / filename, dpi=220)
+                plt.close(fig)
+
+            train_rows = [r for r in hist if "train_loss" in r and "step" in r]
+            if train_rows:
+                steps = np.array([float(r["step"]) for r in train_rows], dtype=float)
+                losses = np.array([float(r["train_loss"]) for r in train_rows], dtype=float)
+                _write_loss_dual_plot(
+                    steps,
+                    losses,
+                    title="Train loss vs step",
+                    xlabel="Training step",
+                    ylabel="Train loss",
+                    filename="train_loss_vs_step.png",
+                )
+
+            val_rows = [r for r in hist if "val_loss" in r and "step" in r]
+            if val_rows:
+                steps = np.array([float(r["step"]) for r in val_rows], dtype=float)
+                losses = np.array([float(r["val_loss"]) for r in val_rows], dtype=float)
+                _write_loss_dual_plot(
+                    steps,
+                    losses,
+                    title="Validation loss vs step",
+                    xlabel="Training step (nearest eval)",
+                    ylabel="Validation loss",
+                    filename="val_loss_vs_step.png",
+                    marker="o",
+                )
 
 
 def cmd_analyze_pre_post(args: argparse.Namespace) -> None:
@@ -919,9 +1230,63 @@ def cmd_analyze_pre_post(args: argparse.Namespace) -> None:
         "per_case_csv": str(csv_path),
     }
     (out_dir / "pre_post_summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-    _write_analysis_plots(per_case, out_dir)
+    _write_analysis_plots(per_case, out_dir, args.training_log)
     print(json.dumps(summary_payload["overall"], indent=2))
     print(f"Wrote analysis outputs in {out_dir}")
+
+
+def cmd_analyze_checkpoints(args: argparse.Namespace) -> None:
+    run_dir = args.run_dir.resolve()
+    checkpoints = sorted(run_dir.glob("**/checkpoints/**/inference_ckpt.pt"), key=lambda p: p.stat().st_mtime)
+    if not checkpoints:
+        raise RuntimeError(f"No checkpoints found under {run_dir}")
+
+    if args.latest_only:
+        checkpoints = [checkpoints[-1]]
+    elif args.max_checkpoints is not None and args.max_checkpoints > 0:
+        checkpoints = checkpoints[-int(args.max_checkpoints) :]
+
+    output_root = args.output_root.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    index_payload: dict[str, object] = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "run_dir": str(run_dir),
+        "dataset_dir": str(args.dataset_dir),
+        "n_checkpoints_analyzed": len(checkpoints),
+        "entries": [],
+    }
+
+    for ckpt in checkpoints:
+        run_id = ckpt.parents[2].name
+        ckpt_step = ckpt.parent.name
+        analysis_dir = output_root / f"analysis_{_safe_id(run_id)}_{_safe_id(ckpt_step)}"
+
+        analyze_args = argparse.Namespace(
+            dataset_dir=args.dataset_dir,
+            output_dir=analysis_dir,
+            fine_tuned_checkpoint=ckpt,
+            base_model=args.base_model,
+            task_name=args.task_name,
+            device=args.device,
+            split=args.split,
+            max_cases=args.max_cases,
+            training_log=args.training_log,
+        )
+        cmd_analyze_pre_post(analyze_args)
+
+        index_payload["entries"].append(
+            {
+                "run_id": run_id,
+                "checkpoint_step_dir": ckpt_step,
+                "checkpoint": str(ckpt),
+                "analysis_dir": str(analysis_dir),
+                "summary_json": str(analysis_dir / "pre_post_summary.json"),
+            }
+        )
+
+    (output_root / "checkpoint_analysis_index.json").write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    print(json.dumps(index_payload, indent=2))
 
 
 def cmd_run_all(args: argparse.Namespace) -> None:
@@ -981,6 +1346,7 @@ def cmd_run_all(args: argparse.Namespace) -> None:
         device=args.device,
         split="test",
         max_cases=None,
+        training_log=None,
     )
     cmd_analyze_pre_post(analyze_args)
 
@@ -997,6 +1363,9 @@ def main() -> None:
         return
     if args.command == "analyze-pre-post":
         cmd_analyze_pre_post(args)
+        return
+    if args.command == "analyze-checkpoints":
+        cmd_analyze_checkpoints(args)
         return
     if args.command == "run-all":
         cmd_run_all(args)
