@@ -264,19 +264,6 @@ Recommended references:
 - https://fair-chem.github.io/
 - https://fair-chem.github.io/fine-tuning/
 
-Required FAIRChem install for fine-tuning (official docs):
-
-```bash
-git clone https://github.com/facebookresearch/fairchem.git
-pip install -e fairchem/packages/fairchem-core[dev]
-```
-
-If your shell aliases `fairchem`, invoke the binary directly from your active env:
-
-```bash
-$(dirname $(which python))/fairchem -c <generated_yaml>
-```
-
 Quick workflow:
 
 ```bash

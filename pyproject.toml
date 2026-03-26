@@ -17,7 +17,7 @@ dependencies = [
   "ase",
   "pymatgen",
   "hiphive",
-  "fairchem-core[dev] @ git+https://github.com/facebookresearch/fairchem.git@main#subdirectory=packages/fairchem-core",
+  "fairchem-core>=2.15.0,<3",
   "torch-sim-atomistic",
   "matgl>=2.0.0",
   "torch~=2.8.0",
