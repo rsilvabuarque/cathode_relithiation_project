@@ -143,6 +143,85 @@ Pointers for references:
 - `for_chat_gpt/2pt_user_guide.pdf`
 - `for_chat_gpt/2pt_paper.pdf`
 
+## Dedicated DIRECT-tiny 2PT experiment
+
+Use `hrw-uma-torchsim-2pt-experiment` for the fixed campaign setup:
+
+- TorchSim-only batched UMA MD (no ASE fallback)
+- one selected structure per lithiation bin from electrode `structure_generation_tiny/best_training_set`
+- one selected structure per LiOH/KOH concentration from electrolyte `best_training_set`
+- NPT equilibration then NVT production (`500000 fs` then `100000 fs` by default)
+- electrode defaults to latest fine-tuned `omat` checkpoint in `uma_finetune_workflow`
+- electrolyte defaults to base UMA model `uma-s-1p2` with task `omol`
+- automatic 2PT export generation for each replica
+- optional post-export execution of C++ 2PT and/or `2pt_python`
+
+Default electrode tiny source root:
+
+- `results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/best_training_set`
+
+Default electrolyte source root:
+
+- `results/publication/default_systems/electrolyte/LiOH_KOH_H2O/structure_generation/best_training_set`
+
+Default fine-tuned electrode model source:
+
+- `results/publication/default_systems/electrode/LCO_mp-22526/structure_generation_tiny/uma_finetune_workflow`
+
+Default T/P mapping (`K:MPa`):
+
+- `393:0.08,433:0.46,473:1.32,493:2.02`
+
+Example (run both electrode + electrolyte campaigns; export only):
+
+```bash
+hrw-uma-torchsim-2pt-experiment \
+  --output-dir runs/uma_tiny_2pt \
+  --replicas 1
+```
+
+Input-preparation only (no MD run):
+
+```bash
+hrw-uma-torchsim-2pt-experiment \
+  --campaign both \
+  --output-dir runs/uma_tiny_2pt_inputs \
+  --prepare-only
+```
+
+Example (electrolyte-only, one structure per concentration):
+
+```bash
+hrw-uma-torchsim-2pt-experiment \
+  --campaign electrolyte \
+  --output-dir runs/uma_tiny_2pt_electrolyte \
+  --electrolyte-model-name uma-s-1p2 \
+  --electrolyte-task-name omol
+```
+
+Example (run both 2PT backends after export):
+
+```bash
+hrw-uma-torchsim-2pt-experiment \
+  --output-dir runs/uma_tiny_2pt \
+  --run-2pt-backends both \
+  --two-pt-cpp-cmd-template "2pt_cpp_exec --traj {traj} --meta {metadata}" \
+  --two-pt-python-cmd-template "python -m 2pt_python.cli --traj {traj} --meta {metadata}"
+```
+
+Install optional `2pt_python` dependency:
+
+```bash
+pip install ".[two-pt]"
+```
+
+Supported command placeholders for backend templates:
+
+- `{export_dir}`
+- `{traj}`
+- `{metadata}`
+- `{type_map}`
+
 ### pe/atom limitation
 
 - `ke_atom` is always exported from masses + velocities.

@@ -681,6 +681,64 @@ def _trajectory_paths(rep_dir: Path, run_name: str) -> tuple[Path, Path, Path]:
     return ts_h5, flat_h5, thermo_csv
 
 
+def _integrate_with_step_eta(
+    ts,
+    integrate_kwargs: dict[str, Any],
+    total_steps: int,
+    *,
+    bar_desc: str,
+    group_size: int,
+    global_bar,
+    global_tracker: _EmaRateTracker,
+) -> float:
+    if total_steps <= 0:
+        return 0.0
+
+    chunk_steps = max(1, min(1000, int(total_steps)))
+    local_tracker = _EmaRateTracker(alpha=0.30)
+    state = integrate_kwargs["system"]
+    base_kwargs = {k: v for k, v in integrate_kwargs.items() if k not in {"system", "n_steps"}}
+
+    done = 0
+    elapsed_total = 0.0
+    step_bar = tqdm(total=int(total_steps), desc=bar_desc, unit="step", leave=False)
+    try:
+        while done < int(total_steps):
+            n_chunk = min(chunk_steps, int(total_steps) - done)
+            call_kwargs = dict(base_kwargs)
+            call_kwargs["system"] = state
+            call_kwargs["n_steps"] = int(n_chunk)
+
+            t0 = time.perf_counter()
+            state = ts.integrate(**call_kwargs)
+            elapsed = time.perf_counter() - t0
+            elapsed_total += elapsed
+            done += int(n_chunk)
+
+            local_tracker.update(int(n_chunk), elapsed)
+            global_tracker.update(int(n_chunk) * int(group_size), elapsed)
+            step_bar.update(int(n_chunk))
+            global_bar.update(int(n_chunk) * int(group_size))
+
+            eta_local = local_tracker.eta(int(total_steps) - done)
+            local_rate = local_tracker.steps_per_sec
+            remaining_global = max(0, int(global_bar.total) - int(global_bar.n))
+            eta_global = global_tracker.eta(remaining_global)
+
+            postfix_bits = []
+            if local_rate is not None:
+                postfix_bits.append(f"rate={local_rate:.1f} step/s")
+            if eta_local is not None:
+                postfix_bits.append(f"eta={_format_duration(eta_local)}")
+            if eta_global is not None:
+                postfix_bits.append(f"eta_total={_format_duration(eta_global)}")
+            if postfix_bits:
+                step_bar.set_postfix_str(" | ".join(postfix_bits))
+    finally:
+        step_bar.close()
+    return elapsed_total
+
+
 def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str) -> None:
     import torch
     import torch_sim as ts
@@ -736,13 +794,9 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
         )
 
     retherm_steps = config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
-    run_plan_steps: list[int] = []
-    for _ in items:
-        for _replica in range(config.replicas):
-            run_plan_steps.extend([retherm_steps + 1, config.prod_steps + 1])
-    completed_steps = 0
-    ema_tracker = _EmaRateTracker(alpha=0.30)
-    global_bar = tqdm(total=len(run_plan_steps), desc=f"{phase} MD batches", unit="run")
+    total_system_steps = int(config.replicas) * int(len(items)) * int(retherm_steps + config.prod_steps)
+    global_tracker = _EmaRateTracker(alpha=0.30)
+    global_bar = tqdm(total=total_system_steps, desc=f"{phase} MD system-steps", unit="sys-step")
 
     for replica in range(config.replicas):
         start_atoms_by_condition: dict[str, Atoms] = {}
@@ -778,12 +832,16 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     rep_dirs.append(rep_dir)
 
                 resume = _determine_resume_plan(ts, ts_files, nsteps, device, dtype)
-                remaining_all_steps = sum(run_plan_steps) - completed_steps
-                eta_total = ema_tracker.eta(remaining_all_steps)
-                if eta_total is None:
-                    global_bar.set_postfix_str("ETA total: collecting performance...")
-                else:
-                    global_bar.set_postfix_str(f"ETA total: {_format_duration(eta_total)}")
+                already_done_steps = max(0, int(nsteps) - int(resume["steps_remaining"]))
+                if already_done_steps > 0:
+                    global_bar.update(already_done_steps * len(cohort))
+                remaining_global = max(0, int(global_bar.total) - int(global_bar.n))
+                eta_total = global_tracker.eta(remaining_global)
+                global_bar.set_postfix_str(
+                    "ETA total: collecting performance..."
+                    if eta_total is None
+                    else f"ETA total: {_format_duration(eta_total)}"
+                )
 
                 if not resume["completed"]:
                     if resume["resume_mode"]:
@@ -825,13 +883,21 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     if run_name == "retherm" and pressure_mpa is not None:
                         kwargs["external_pressure"] = (float(pressure_mpa) / 101325.0) * EV_A3_PER_ATM
 
-                    t0 = time.perf_counter()
                     try:
-                        ts.integrate(**kwargs)
+                        elapsed = _integrate_with_step_eta(
+                            ts,
+                            kwargs,
+                            int(resume["steps_remaining"]),
+                            bar_desc=(
+                                f"{phase} rep{replica:03d} {run_name} "
+                                f"T={temp_k:.1f}K batch={len(cohort)}"
+                            ),
+                            group_size=len(cohort),
+                            global_bar=global_bar,
+                            global_tracker=global_tracker,
+                        )
                     finally:
                         rep.close()
-                    elapsed = time.perf_counter() - t0
-                    ema_tracker.update(max(1, int(resume["steps_remaining"])), elapsed)
                 else:
                     elapsed = 0.0
 
@@ -880,7 +946,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         "charge": item.charge,
                         "spin": item.spin,
                         "n_li": item.n_li,
-                        "seed": int(config.base_seed + item_idx * 1000 + replica),
+                        "seed": int(config.base_seed + _item_idx * 1000 + replica),
                         "device": device_name,
                         "ensemble_retherm": "npt",
                         "ensemble_production": "nvt",
@@ -897,8 +963,6 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     }
                     (rep_dirs[idx] / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-                completed_steps += (nsteps + 1)
-                global_bar.update(len(cohort))
                 _update_run_state(
                     out_root / "run_state.json",
                     phase=phase,
@@ -906,6 +970,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     run_name=run_name,
                     batch_group_size=len(cohort),
                     steps_completed_runs=int(global_bar.n),
+                    system_steps_completed=int(global_bar.n),
                 )
 
     global_bar.set_postfix_str("completed")
