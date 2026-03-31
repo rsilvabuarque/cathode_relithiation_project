@@ -71,6 +71,14 @@ def test_uma_torchsim_screen_smoke(tmp_path: Path, monkeypatch) -> None:
     export_files = list((base / "export2pt").glob("**/prod.lammpstrj"))
     assert export_files
 
+    type_maps = list((base / "export2pt").glob("**/type_map.json"))
+    assert type_maps
+    type_map_sample = json.loads(type_maps[0].read_text(encoding="utf-8"))
+    assert "forces_available" in type_map_sample
+    assert "ke_atom_available" in type_map_sample
+    assert "pe_atom_available" in type_map_sample
+    assert "atom_eng_available" in type_map_sample
+
     desc_files = list(base.glob("**/descriptors.json"))
     assert desc_files
     sample = json.loads(desc_files[0].read_text(encoding="utf-8"))

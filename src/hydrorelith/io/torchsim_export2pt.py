@@ -28,6 +28,32 @@ def export_h5md_to_lammps_dump(
     unwrap: bool = True,
     include_ke_atom: bool = True,
 ) -> None:
+    def _normalize_frame_atom_array(arr: np.ndarray, nframes: int, natoms: int) -> np.ndarray:
+        out = np.asarray(arr, dtype=float)
+        if out.ndim == 1:
+            if nframes != 1 or out.shape[0] != natoms:
+                raise ValueError(
+                    f"Invalid atomwise array shape {out.shape}; expected ({nframes},{natoms}) or ({natoms},) for a single frame"
+                )
+            return out.reshape(1, natoms)
+        if out.ndim >= 2:
+            out = out.reshape(out.shape[0], -1)
+            if out.shape == (nframes, natoms):
+                return out
+        raise ValueError(f"Invalid atomwise array shape {out.shape}; expected ({nframes},{natoms})")
+
+    def _normalize_frame_atom_vec3(arr: np.ndarray, nframes: int, natoms: int) -> np.ndarray:
+        out = np.asarray(arr, dtype=float)
+        if out.ndim == 2:
+            if nframes != 1 or out.shape != (natoms, 3):
+                raise ValueError(
+                    f"Invalid vector array shape {out.shape}; expected ({nframes},{natoms},3) or ({natoms},3) for a single frame"
+                )
+            return out.reshape(1, natoms, 3)
+        if out.ndim == 3 and out.shape == (nframes, natoms, 3):
+            return out
+        raise ValueError(f"Invalid vector array shape {out.shape}; expected ({nframes},{natoms},3)")
+
     data = _read_h5md(traj_h5md)
     positions = np.asarray(data["positions"], dtype=float)
     velocities = np.asarray(data["velocities"], dtype=float)
@@ -54,8 +80,19 @@ def export_h5md_to_lammps_dump(
     z_to_type = {zz: i + 1 for i, zz in enumerate(unique_z)}
     type_ids = np.array([z_to_type[int(zz)] for zz in z], dtype=int)
 
-    atom_pe = data.get("atom_potential_energy")
+    nframes = int(positions.shape[0])
+    natoms = int(len(z))
+
+    forces = None
+    if "forces" in data:
+        forces = _normalize_frame_atom_vec3(np.asarray(data["forces"], dtype=float), nframes, natoms)
+    forces_available = forces is not None
+
+    atom_pe = None
+    if "atom_potential_energy" in data:
+        atom_pe = _normalize_frame_atom_array(np.asarray(data["atom_potential_energy"], dtype=float), nframes, natoms)
     pe_atom_available = atom_pe is not None
+    atom_eng_available = pe_atom_available
 
     out_lammpstrj.parent.mkdir(parents=True, exist_ok=True)
     with out_lammpstrj.open("w", encoding="utf-8") as handle:
@@ -76,9 +113,13 @@ def export_h5md_to_lammps_dump(
                 cols.append("ke_atom")
             if pe_atom_available:
                 cols.append("pe_atom")
+                cols.append("atomEng")
+            if forces_available:
+                cols.extend(["fx", "fy", "fz"])
             handle.write("ITEM: ATOMS " + " ".join(cols) + "\n")
 
             ke_atom = 0.5 * masses * np.sum(velocities[frame] ** 2, axis=1) / AMU_TO_EV_PS2_PER_A2
+            atom_eng = (ke_atom + atom_pe[frame]) if atom_eng_available else None
             for i in range(len(z)):
                 vals = [
                     str(i + 1),
@@ -94,11 +135,24 @@ def export_h5md_to_lammps_dump(
                     vals.append(f"{ke_atom[i]:.10f}")
                 if pe_atom_available:
                     vals.append(f"{float(atom_pe[frame, i]):.10f}")
+                    vals.append(f"{float(atom_eng[i]):.10f}")
+                if forces_available:
+                    vals.extend(
+                        [
+                            f"{float(forces[frame, i, 0]):.10f}",
+                            f"{float(forces[frame, i, 1]):.10f}",
+                            f"{float(forces[frame, i, 2]):.10f}",
+                        ]
+                    )
                 handle.write(" ".join(vals) + "\n")
 
     type_map = {
         "atomic_number_to_type": {str(k): int(v) for k, v in z_to_type.items()},
+        "forces_available": bool(forces_available),
+        "ke_atom_available": bool(include_ke_atom),
         "pe_atom_available": bool(pe_atom_available),
+        "atom_eng_available": bool(atom_eng_available),
+        "atom_eng_definition": "atomEng = ke_atom + pe_atom (eV)",
     }
     (out_lammpstrj.parent / "type_map.json").write_text(json.dumps(type_map, indent=2), encoding="utf-8")
 

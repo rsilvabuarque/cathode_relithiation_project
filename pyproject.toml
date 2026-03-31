@@ -42,6 +42,7 @@ hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:m
 hrw-electrolyte-generate = "hydrorelith.pipelines.electrolyte_structure_generation:main"
 hrw-scf-parallel-benchmark = "hydrorelith.pipelines.scf_parallelization_benchmark:main"
 hrw-electrode-vasp-workflow = "hydrorelith.pipelines.electrode_vasp_workflow:main"
+hrw-electrolyte-vasp-workflow = "hydrorelith.pipelines.electrolyte_vasp_workflow:main"
 hrw-uma-torchsim-screen = "hydrorelith.pipelines.uma_torchsim_screen:main"
 hrw-uma-torchsim-analyze = "hydrorelith.pipelines.uma_torchsim_screen:main_analyze"
 hrw-uma-torchsim-export2pt = "hydrorelith.pipelines.uma_torchsim_screen:main_export2pt"

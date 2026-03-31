@@ -222,11 +222,13 @@ Supported command placeholders for backend templates:
 - `{metadata}`
 - `{type_map}`
 
-### pe/atom limitation
+### Per-atom export semantics
 
-- `ke_atom` is always exported from masses + velocities.
+- `ke_atom` is exported from masses + velocities.
 - `pe_atom` is exported only when atomwise potential energies are available from model outputs.
-- If unavailable, atomwise PE is not fabricated; `type_map.json` marks `pe_atom_available=false` and total PE remains in thermo logs.
+- `atomEng` is exported only when `pe_atom` is available, with definition: `atomEng = ke_atom + pe_atom`.
+- Force columns (`fx fy fz`) are exported when force arrays are present in `prod.h5md`.
+- If atomwise PE is unavailable, it is not fabricated: `pe_atom` and `atomEng` are omitted and `type_map.json` reports `pe_atom_available=false` and `atom_eng_available=false`.
 
 ## Output Layout
 

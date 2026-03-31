@@ -441,12 +441,28 @@ def _load_flat_traj_for_analysis(ts, torchsim_h5: Path, flat_h5: Path, pressure_
                 out = out[:, 0]
         return out
 
+    def _frame_atom_array(arr: np.ndarray, nframes: int, natoms: int) -> np.ndarray | None:
+        out = np.asarray(arr, dtype=float)
+        if out.ndim == 0:
+            return None
+        if out.ndim == 1:
+            if nframes == 1 and out.shape[0] == natoms:
+                return out.reshape(1, natoms)
+            return None
+        out = out.reshape(out.shape[0], -1)
+        if out.shape == (nframes, natoms):
+            return out
+        if out.shape[0] == 1 and out.shape[1] == natoms and nframes > 1:
+            return np.repeat(out, nframes, axis=0)
+        return None
+
     with ts.TorchSimTrajectory(str(torchsim_h5), mode="r") as traj:
         nframes = len(traj)
         if nframes <= 0:
             raise RuntimeError(f"Empty trajectory generated at {torchsim_h5}")
         steps = np.asarray(traj.get_steps("positions"), dtype=int)
         positions = np.asarray(traj.get_array("positions"), dtype=float)
+        natoms = int(positions.shape[1])
         velocities = np.asarray(traj.get_array("velocities"), dtype=float) if "velocities" in traj.array_registry else np.zeros_like(positions)
         forces = np.asarray(traj.get_array("forces"), dtype=float) if "forces" in traj.array_registry else np.zeros_like(positions)
         cells = np.asarray(traj.get_array("cell"), dtype=float)
@@ -455,7 +471,34 @@ def _load_flat_traj_for_analysis(ts, torchsim_h5: Path, flat_h5: Path, pressure_
         if cells.shape[0] == 1 and nframes > 1:
             cells = np.repeat(cells, nframes, axis=0)
 
-        potential_energy = _frame_scalars(np.asarray(traj.get_array("potential_energy_eV"), dtype=float), nframes) if "potential_energy_eV" in traj.array_registry else np.zeros((nframes,), dtype=float)
+        atom_potential_energy = None
+        if "atom_potential_energy" in traj.array_registry:
+            atom_potential_energy = _frame_atom_array(
+                np.asarray(traj.get_array("atom_potential_energy"), dtype=float),
+                nframes,
+                natoms,
+            )
+
+        if "potential_energy_eV" in traj.array_registry:
+            pe_raw = np.asarray(traj.get_array("potential_energy_eV"), dtype=float)
+            pe_atom_from_total = _frame_atom_array(pe_raw, nframes, natoms)
+            if pe_atom_from_total is not None:
+                atom_potential_energy = pe_atom_from_total
+                potential_energy = np.sum(pe_atom_from_total, axis=1)
+            else:
+                potential_energy = _frame_scalars(pe_raw, nframes)
+        else:
+            potential_energy = np.zeros((nframes,), dtype=float)
+
+        if atom_potential_energy is None:
+            for key in ("pe_atom", "potential_energy_per_atom", "potential_energy_atom", "energy_per_atom_eV"):
+                if key not in traj.array_registry:
+                    continue
+                candidate = _frame_atom_array(np.asarray(traj.get_array(key), dtype=float), nframes, natoms)
+                if candidate is not None:
+                    atom_potential_energy = candidate
+                    break
+
         kinetic_energy = _frame_scalars(np.asarray(traj.get_array("kinetic_energy_eV"), dtype=float), nframes) if "kinetic_energy_eV" in traj.array_registry else np.zeros((nframes,), dtype=float)
         temperature = _frame_scalars(np.asarray(traj.get_array("temperature_K"), dtype=float), nframes) if "temperature_K" in traj.array_registry else np.zeros((nframes,), dtype=float)
         volume = _frame_scalars(np.asarray(traj.get_array("volume_A3"), dtype=float), nframes) if "volume_A3" in traj.array_registry else np.abs(np.linalg.det(cells))
@@ -482,7 +525,7 @@ def _load_flat_traj_for_analysis(ts, torchsim_h5: Path, flat_h5: Path, pressure_
         "kinetic_energy": kinetic_energy,
         "temperature": temperature,
         "volume": volume,
-        "atom_potential_energy": None,
+        "atom_potential_energy": atom_potential_energy,
         "density_g_cm3": density,
         "pressure_MPa": pressure_mpa_series,
     }
