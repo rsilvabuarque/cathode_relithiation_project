@@ -18,6 +18,7 @@ def load_fairchem_model(model_name: str, task_name: str, device: str, compute_st
         model=model_name,
         task_name=task_name,
         compute_stress=compute_stress,
+        compute_per_atom_energies=True,
         device=device,
     )
 

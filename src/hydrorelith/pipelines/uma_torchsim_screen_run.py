@@ -349,6 +349,37 @@ def _build_prop_calculators(ts):
     def _pressure_atm(state, model=None):
         return _pressure_ev_a3(state, model) * (PA_PER_EV_A3 / 101325.0)
 
+    def _atom_potential_energy(state, model=None):
+        if model is None:
+            raise RuntimeError("Per-atom energy reporter requires model")
+
+        out = model(state)
+        for key in (
+            "energies",
+            "atom_potential_energy",
+            "pe_atom",
+            "potential_energy_per_atom",
+            "potential_energy_atom",
+            "energy_per_atom_eV",
+        ):
+            if key not in out:
+                continue
+            values = out[key]
+            if values is None:
+                continue
+            if values.ndim == 0:
+                continue
+            if values.ndim == 2 and values.shape[1] == 1:
+                values = values[:, 0]
+            if values.ndim != 1:
+                continue
+            return values
+
+        raise RuntimeError(
+            "Model output has no per-atom potential-energy array; ensure model "
+            "is configured with compute_per_atom_energies=True"
+        )
+
     def _total_energy(state, model=None):
         return _potential_energy(state) + _kinetic_energy(state)
 
@@ -383,6 +414,7 @@ def _build_prop_calculators(ts):
             "volume_A3": lambda state, model=None: _volume(state),
             "density_g_cm3": lambda state, model=None: _density(state),
             "potential_energy_eV": lambda state, model=None: _potential_energy(state),
+            "atom_potential_energy": lambda state, model=None: _atom_potential_energy(state, model),
             "kinetic_energy_eV": lambda state, model=None: _kinetic_energy(state),
             "total_energy_eV": lambda state, model=None: _total_energy(state),
             "delta_total_energy_eV": _delta_total,
@@ -491,7 +523,7 @@ def _load_flat_traj_for_analysis(ts, torchsim_h5: Path, flat_h5: Path, pressure_
             potential_energy = np.zeros((nframes,), dtype=float)
 
         if atom_potential_energy is None:
-            for key in ("pe_atom", "potential_energy_per_atom", "potential_energy_atom", "energy_per_atom_eV"):
+            for key in ("energies", "pe_atom", "potential_energy_per_atom", "potential_energy_atom", "energy_per_atom_eV"):
                 if key not in traj.array_registry:
                     continue
                 candidate = _frame_atom_array(np.asarray(traj.get_array(key), dtype=float), nframes, natoms)

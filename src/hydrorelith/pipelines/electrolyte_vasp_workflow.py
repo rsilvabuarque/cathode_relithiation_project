@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pymatgen.core import Structure
-from pymatgen.io.vasp.inputs import Kpoints
+from pymatgen.io.vasp.inputs import Kpoints, Poscar
 from pymatgen.io.vasp.sets import MPStaticSet
 
 
@@ -261,7 +261,7 @@ def _prepare_case(
     case_dir.mkdir(parents=True, exist_ok=True)
 
     structure = Structure.from_file(str(structure_path))
-    structure.to(fmt="poscar", filename=str(case_dir / "POSCAR"))
+    Poscar(structure).write_file(str(case_dir / "POSCAR"))
 
     template_dir = args.template_dir
     template_used = bool(template_dir is not None)

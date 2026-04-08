@@ -27,9 +27,6 @@ dependencies = [
 matgl-dgl = [
   "dgl>=2.2.0,<2.5",
 ]
-two-pt = [
-  "2pt_python @ git+https://github.com/rsilvabuarque/2pt_python",
-]
 dev = [
   "pytest",
   "ruff",
@@ -42,11 +39,11 @@ hrw-electrode-generate = "hydrorelith.pipelines.electrode_structure_generation:m
 hrw-electrolyte-generate = "hydrorelith.pipelines.electrolyte_structure_generation:main"
 hrw-scf-parallel-benchmark = "hydrorelith.pipelines.scf_parallelization_benchmark:main"
 hrw-electrode-vasp-workflow = "hydrorelith.pipelines.electrode_vasp_workflow:main"
-hrw-electrolyte-vasp-workflow = "hydrorelith.pipelines.electrolyte_vasp_workflow:main"
 hrw-uma-torchsim-screen = "hydrorelith.pipelines.uma_torchsim_screen:main"
 hrw-uma-torchsim-analyze = "hydrorelith.pipelines.uma_torchsim_screen:main_analyze"
 hrw-uma-torchsim-export2pt = "hydrorelith.pipelines.uma_torchsim_screen:main_export2pt"
 hrw-uma-torchsim-2pt-experiment = "hydrorelith.pipelines.uma_torchsim_2pt_experiment:main"
+hrw-uma-water-2pt-experiment = "hydrorelith.pipelines.uma_water_2pt_experiment:main"
 hrw-uma-torchsim-manifest-template = "hydrorelith.io.structure_manifest:main_template"
 hrw-uma-finetune-vasp-workflow = "hydrorelith.pipelines.uma_finetune_vasp_workflow:main"
 

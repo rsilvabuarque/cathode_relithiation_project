@@ -128,6 +128,8 @@ Recommended for production reruns on fixed manifests:
 Use stage `export-2pt` (or `--export-2pt`) to generate:
 
 - `prod.lammpstrj` with `id type xu yu zu vx vy vz` (+ extras)
+- `prod.lammps` (LAMMPS trajectory alias)
+- `prod.eng` (LAMMPS-like thermo log derived from TorchSim `prod_thermo.csv`)
 - `type_map.json`
 - `2pt_metadata.json`
 
@@ -230,6 +232,31 @@ Supported command placeholders for backend templates:
 - Force columns (`fx fy fz`) are exported when force arrays are present in `prod.h5md`.
 - If atomwise PE is unavailable, it is not fabricated: `pe_atom` and `atomEng` are omitted and `type_map.json` reports `pe_atom_available=false` and `atom_eng_available=false`.
 
+## Single water-box 2PT benchmark
+
+Use `hrw-uma-water-2pt-experiment` to run one electrolyte job from a single CIF with:
+
+- UMA `uma-s-1p2` on task `omol`
+- NPT at 298 K / 1 atm for 10 ps
+- NVT production for 50 ps
+- 1 fs timestep
+- one replica/job (no same-GPU parallel batch scheduling)
+
+Example:
+
+```bash
+hrw-uma-water-2pt-experiment \
+  --cif-path default_structures/electrolyte_templates/H2O.cif \
+  --output-dir runs/uma_water_2pt \
+  --sname electrolyte
+```
+
+This writes both generic and `${sname}`-prefixed 2PT inputs under export output directories:
+
+- `prod.lammpstrj`, `prod.lammps`, `prod.eng`
+- `${sname}_prod.lammpstrj`, `${sname}_prod.lammps`, `${sname}_prod.eng`
+- `2pt_metadata.json`, `type_map.json`
+
 ## Output Layout
 
 The workflow writes:
@@ -238,7 +265,7 @@ The workflow writes:
 - `electrolyte/<condition_id>/replica_000/{...}`
 - `electrode/<condition_id>/replica_000/{retherm.trajectory.h5,prod.trajectory.h5,retherm_thermo_detailed.csv,prod_thermo_detailed.csv}`
 - `electrolyte/<condition_id>/replica_000/{...}`
-- `export2pt/<phase>/<condition_id>/replica_000/{prod.lammpstrj,type_map.json,2pt_metadata.json}`
+- `export2pt/<phase>/<condition_id>/replica_000/{prod.lammpstrj,prod.lammps,prod.eng,type_map.json,2pt_metadata.json}`
 - `merged/{features.csv,regression_summary.json,pred_vs_true.csv}`
 - `plots/*.png`
 

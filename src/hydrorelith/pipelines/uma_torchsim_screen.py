@@ -43,7 +43,11 @@ from hydrorelith.analysis.uma_torchsim_regression import (
     fit_simple_models,
     load_experimental_rates,
 )
-from hydrorelith.io.torchsim_export2pt import export_h5md_to_lammps_dump, write_2pt_metadata
+from hydrorelith.io.torchsim_export2pt import (
+    export_h5md_to_lammps_dump,
+    write_2pt_metadata,
+    write_lammps_eng_from_thermo_csv,
+)
 from hydrorelith.pipelines.uma_torchsim_screen_config import ScreenConfig, parse_args_to_config
 from hydrorelith.pipelines.uma_torchsim_screen_run import run_one_phase
 
@@ -552,7 +556,21 @@ def _run_export_2pt(config: ScreenConfig, phase: str) -> None:
                 continue
             out_dir = out_root / cond_dir.name / rep_dir.name
             out_dir.mkdir(parents=True, exist_ok=True)
-            export_h5md_to_lammps_dump(prod_h5, out_dir / "prod.lammpstrj", unwrap=True, include_ke_atom=True)
+            export_h5md_to_lammps_dump(
+                prod_h5,
+                out_dir / "prod.lammpstrj",
+                unwrap=True,
+                include_ke_atom=True,
+                lammps_template_style=True,
+            )
+            export_h5md_to_lammps_dump(
+                prod_h5,
+                out_dir / "prod.lammps",
+                unwrap=True,
+                include_ke_atom=True,
+                lammps_template_style=True,
+            )
+            write_lammps_eng_from_thermo_csv(thermo, out_dir / "prod.eng")
             write_2pt_metadata(
                 thermo,
                 out_dir / "2pt_metadata.json",

@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from hydrorelith.io.torchsim_export2pt import AMU_TO_EV_PS2_PER_A2, export_h5md_to_lammps_dump
+from hydrorelith.io.torchsim_export2pt import (
+    AMU_TO_EV_PS2_PER_A2,
+    export_h5md_to_lammps_dump,
+    write_lammps_eng_from_thermo_csv,
+)
 
 
 @pytest.fixture
@@ -92,3 +96,57 @@ def test_export_omits_atom_eng_when_atom_pe_absent(tmp_path: Path, h5py_mod) -> 
     assert type_map["ke_atom_available"] is True
     assert type_map["pe_atom_available"] is False
     assert type_map["atom_eng_available"] is False
+
+
+def test_export_template_style_uses_v_atomEng_columns(tmp_path: Path, h5py_mod) -> None:
+    traj = tmp_path / "traj_template.h5md"
+    out_dump = tmp_path / "prod_template.lammpstrj"
+    _write_minimal_h5md(traj, h5py_mod, with_atom_pe=True)
+
+    export_h5md_to_lammps_dump(
+        traj,
+        out_dump,
+        unwrap=True,
+        include_ke_atom=True,
+        lammps_template_style=True,
+    )
+
+    cols, vals = _first_atoms_header_and_row(out_dump)
+    assert cols == ["id", "mol", "type", "q", "xu", "yu", "zu", "vx", "vy", "vz", "v_atomEng"]
+    col_to_val = {name: vals[i] for i, name in enumerate(cols)}
+    expected_ke = 0.5 * 1.0 * (2.0**2) / AMU_TO_EV_PS2_PER_A2
+    assert col_to_val["id"] == pytest.approx(1.0)
+    assert col_to_val["mol"] == pytest.approx(1.0)
+    assert col_to_val["q"] == pytest.approx(0.0)
+    assert col_to_val["v_atomEng"] == pytest.approx(expected_ke + 0.1)
+
+    type_map = json.loads((tmp_path / "type_map.json").read_text(encoding="utf-8"))
+    assert type_map["lammps_template_style"] is True
+    assert type_map["v_atomeng_contains_pe_atom"] is True
+    assert type_map["dump_columns"] == cols
+
+
+def test_write_lammps_eng_from_thermo_csv(tmp_path: Path) -> None:
+    thermo = tmp_path / "prod_thermo.csv"
+    thermo.write_text(
+        "step,time_ps,potential_energy_eV,kinetic_energy_eV,temperature_K,volume_A3,pressure_MPa\n"
+        "0,0.000,-10.0,1.5,298.0,1000.0,1.0\n"
+        "4,0.004,-9.8,1.6,300.0,1001.0,1.0\n",
+        encoding="utf-8",
+    )
+    out_eng = tmp_path / "prod.eng"
+
+    write_lammps_eng_from_thermo_csv(thermo, out_eng)
+
+    lines = out_eng.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("# LAMMPS-like thermo log")
+    assert lines[1] == "# thermo 4"
+    assert lines[2].startswith("# thermo_style custom etotal ke temp pe")
+    assert lines[3] == "# thermo_modify line multi"
+    assert "Step 0" in lines[4]
+    assert "TotEng = -8.5000000000" in lines[5]
+    assert "KinEng = 1.5000000000" in lines[5]
+    assert "Temp = 298.0000000000" in lines[5]
+    assert "PotEng = -10.0000000000" in lines[5]
+    assert "Press = 9.8692326672" in lines[8]
+    assert "Volume = 1000.0000000000" in lines[8]

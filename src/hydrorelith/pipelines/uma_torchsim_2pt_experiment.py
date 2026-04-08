@@ -332,7 +332,11 @@ def _write_electrolyte_manifest(
 
 
 def _export_2pt_for_phase(config: ScreenConfig, phase: str) -> Path:
-    from hydrorelith.io.torchsim_export2pt import export_h5md_to_lammps_dump, write_2pt_metadata
+    from hydrorelith.io.torchsim_export2pt import (
+        export_h5md_to_lammps_dump,
+        write_2pt_metadata,
+        write_lammps_eng_from_thermo_csv,
+    )
 
     phase_root = config.output_dir / "uma_torchsim_screen" / phase
     out_root = config.output_dir / "uma_torchsim_screen" / "export2pt" / phase
@@ -346,7 +350,21 @@ def _export_2pt_for_phase(config: ScreenConfig, phase: str) -> Path:
                 continue
             out_dir = out_root / cond_dir.name / rep_dir.name
             out_dir.mkdir(parents=True, exist_ok=True)
-            export_h5md_to_lammps_dump(prod_h5, out_dir / "prod.lammpstrj", unwrap=True, include_ke_atom=True)
+            export_h5md_to_lammps_dump(
+                prod_h5,
+                out_dir / "prod.lammpstrj",
+                unwrap=True,
+                include_ke_atom=True,
+                lammps_template_style=True,
+            )
+            export_h5md_to_lammps_dump(
+                prod_h5,
+                out_dir / "prod.lammps",
+                unwrap=True,
+                include_ke_atom=True,
+                lammps_template_style=True,
+            )
+            write_lammps_eng_from_thermo_csv(thermo, out_dir / "prod.eng")
             write_2pt_metadata(
                 thermo,
                 out_dir / "2pt_metadata.json",
