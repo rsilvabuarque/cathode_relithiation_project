@@ -663,7 +663,7 @@ def _determine_resume_plan(ts, files: list[Path], n_steps_target: int, device, d
 
 def _resolve_memory_scalers(ts, states, model, config: ScreenConfig):
     if str(getattr(model, "device", "")) == "cpu":
-        return [float(len(s.atomic_numbers)) for s in states], None, "cpu_disabled"
+        return None, "cpu_disabled"
 
     metric_name = getattr(model, "memory_scales_with", "n_atoms")
     try:
@@ -679,84 +679,7 @@ def _resolve_memory_scalers(ts, states, model, config: ScreenConfig):
         except Exception:
             source = "unavailable"
             resolved = None
-    return metrics, resolved, source
-
-
-def _benchmark_counts(config: ScreenConfig, n_total: int) -> list[int]:
-    max_systems = config.benchmark_max_systems or n_total
-    max_systems = min(max_systems, n_total)
-    counts = list(range(1, max_systems + 1, max(1, config.benchmark_step_size)))
-    if counts and counts[-1] != max_systems:
-        counts.append(max_systems)
-    return counts
-
-
-def _save_benchmark_rows(rows: list[dict[str, Any]], out_dir: Path) -> None:
-    if not rows:
-        return
-    rows = sorted(rows, key=lambda r: int(r["n_systems"]))
-    out_csv = out_dir / "batch_scaling.csv"
-    with out_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _benchmark_batch_scaling(ts, atoms_list: list[Atoms], model, config: ScreenConfig, *, device, dtype, seed: int, out_dir: Path, memory_scalers: list[float], resolved_max_memory_scaler: float | None, scaler_source: str) -> None:
-    counts = _benchmark_counts(config, len(atoms_list))
-    if not counts:
-        return
-    bench_dir = out_dir / "batch_benchmark"
-    bench_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, Any]] = []
-
-    for nsys in counts:
-        subset = atoms_list[:nsys]
-        states = [ts.initialize_state(at, device=device, dtype=dtype) for at in subset]
-        for idx, st in enumerate(states):
-            st.rng = int(seed + idx)
-        state = ts.concatenate_states(states)
-        state.rng = int(seed)
-
-        warm = ts.integrate(
-            system=state,
-            model=model,
-            integrator=ts.Integrator.nvt_langevin,
-            n_steps=config.benchmark_warmup_steps,
-            temperature=float(config.benchmark_temperature_k),
-            timestep=float(config.timestep_ps),
-            trajectory_reporter=None,
-            autobatcher=_build_autobatcher(ts, model, config, resolved_max_memory_scaler),
-            pbar=False,
-        )
-        t0 = time.perf_counter()
-        final = ts.integrate(
-            system=warm,
-            model=model,
-            integrator=ts.Integrator.nvt_langevin,
-            n_steps=config.benchmark_steps,
-            temperature=float(config.benchmark_temperature_k),
-            timestep=float(config.timestep_ps),
-            trajectory_reporter=None,
-            autobatcher=_build_autobatcher(ts, model, config, resolved_max_memory_scaler),
-            pbar=False,
-        )
-        elapsed = time.perf_counter() - t0
-        natoms = int(final.positions.shape[0])
-        atom_steps_per_s = (natoms * config.benchmark_steps) / max(elapsed, 1e-12)
-        scaler_total = float(sum(memory_scalers[:nsys])) if memory_scalers else math.nan
-        row = {
-            "n_systems": nsys,
-            "total_atoms": natoms,
-            "steps": int(config.benchmark_steps),
-            "elapsed_s": float(elapsed),
-            "atom_steps_per_s": float(atom_steps_per_s),
-            "memory_scaler_total": scaler_total,
-            "estimated_max_memory_scaler": resolved_max_memory_scaler if resolved_max_memory_scaler is not None else math.nan,
-            "max_memory_scaler_source": scaler_source,
-        }
-        rows.append(row)
-        _save_benchmark_rows(rows, bench_dir)
+    return resolved, source
 
 
 def _is_prod_segment_name(run_name: str) -> bool:
@@ -1065,7 +988,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
         initial_atoms.append(atoms)
 
     initial_states = [ts.initialize_state(at, device=device, dtype=dtype) for at in initial_atoms]
-    memory_scalers, resolved_max_memory_scaler, scaler_source = _resolve_memory_scalers(ts, initial_states, model, config)
+    resolved_max_memory_scaler, scaler_source = _resolve_memory_scalers(ts, initial_states, model, config)
     retherm_steps = int(config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode)
     production_segment_steps = _split_steps_for_segments(int(config.prod_steps), int(config.production_stages))
     production_stage_names = [f"prod_2pt_{idx + 1:02d}" for idx in range(len(production_segment_steps))]
@@ -1105,24 +1028,8 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
             "stage_plan": [{"name": name, "steps": int(steps)} for name, steps in stage_plan],
             "dump_every_steps": config.dump_every_steps,
             "timestep_ps": config.timestep_ps,
-            "benchmark_skipped": config.skip_batch_benchmark,
         },
     )
-
-    if not config.skip_batch_benchmark and device.type != "cpu":
-        _benchmark_batch_scaling(
-            ts,
-            initial_atoms,
-            model,
-            config,
-            device=device,
-            dtype=dtype,
-            seed=config.base_seed,
-            out_dir=out_root,
-            memory_scalers=memory_scalers,
-            resolved_max_memory_scaler=resolved_max_memory_scaler,
-            scaler_source=scaler_source,
-        )
 
     total_steps_per_system = int(sum(int(steps) for _, steps in stage_plan))
     total_system_steps = int(config.replicas) * int(len(items)) * int(total_steps_per_system)

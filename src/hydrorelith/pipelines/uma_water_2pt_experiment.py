@@ -166,7 +166,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spin", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-memory-scaler", type=float, default=None)
-    parser.add_argument("--skip-batch-benchmark", action="store_true", default=True)
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -217,7 +216,6 @@ def main() -> None:
     config.replicas = 1
     config.base_seed = int(args.seed)
     config.compute_stress = True
-    config.skip_batch_benchmark = bool(args.skip_batch_benchmark)
     config.max_memory_scaler = args.max_memory_scaler
     config.precision = args.precision
     config.debug = bool(args.debug)

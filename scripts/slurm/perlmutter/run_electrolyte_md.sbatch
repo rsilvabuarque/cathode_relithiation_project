@@ -28,5 +28,4 @@ hrw-uma-torchsim-screen \
   --output-dir runs/uma_torchsim \
   --device cuda \
   --precision float32 \
-  --max-memory-scaler 12000 \
-  --skip-batch-benchmark
+  --max-memory-scaler 12000

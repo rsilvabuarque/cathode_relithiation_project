@@ -75,7 +75,7 @@ The repository now includes clone-visible publication input structures under:
 Use the commands below to run MD plus py2pt with maximum practical parallelism on a single node:
 
 - Keep MD enabled by not passing `--skip-md`.
-- Keep TorchSim GPU autobatch benchmarking enabled by not passing `--skip-batch-benchmark`.
+- TorchSim autobatching/memory estimation is handled internally; set `--max-memory-scaler` only when you want to reuse a known value.
 - Use all visible CPU cores for py2pt via `--py2pt-workers "$(nproc)"`.
 
 Electrolyte (publication classical data files):

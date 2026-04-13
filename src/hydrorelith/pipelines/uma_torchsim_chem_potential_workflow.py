@@ -366,7 +366,6 @@ def _build_config(args: argparse.Namespace, system_type: str, manifest_path: Pat
     cfg.replicas = args.replicas
     cfg.base_seed = args.base_seed
     cfg.compute_stress = True
-    cfg.skip_batch_benchmark = args.skip_batch_benchmark
     cfg.max_memory_scaler = args.max_memory_scaler
     cfg.precision = args.precision
     cfg.debug = args.debug
@@ -1079,7 +1078,6 @@ def _generate_slurm_scripts(args: argparse.Namespace, manifest_path: Path, manif
             f"--retherm-steps-electrolyte {args.npt_equil_steps} "
             f"--prod-steps {args.nvt_prod_steps} "
             f"--production-stages {args.production_stages} "
-            f"{'--skip-batch-benchmark' if args.skip_batch_benchmark else ''} "
             f"{f'--max-memory-scaler {args.max_memory_scaler}' if args.max_memory_scaler is not None else ''}\n"
         )
         script.write_text(content, encoding="utf-8")
@@ -1171,7 +1169,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-seed", type=int, default=0)
 
     parser.add_argument("--max-memory-scaler", type=float, default=None)
-    parser.add_argument("--skip-batch-benchmark", action="store_true")
     parser.add_argument("--debug", action="store_true")
 
     parser.add_argument("--skip-md", action="store_true")

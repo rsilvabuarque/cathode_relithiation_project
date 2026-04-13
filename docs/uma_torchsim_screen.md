@@ -64,9 +64,8 @@ Key runtime defaults:
 - `--replicas 3`
 
 Batching/throughput controls:
-- `--max-memory-scaler <float>` to reuse a known scaler and avoid repeated estimation.
-- `--skip-batch-benchmark` to disable the optional batch-scaling benchmark.
-- `--benchmark-steps`, `--benchmark-warmup-steps`, `--benchmark-max-systems`, `--benchmark-step-size`.
+- TorchSim handles autobatching/memory estimation natively.
+- `--max-memory-scaler <float>` can be used to reuse a known scaler and avoid repeated estimation.
 - `--precision {float32,float64}` and `--debug` for runtime diagnostics.
 
 Resume behavior:
@@ -84,8 +83,6 @@ hrw-uma-torchsim-screen \
   --stage all \
   --device cuda \
   --max-memory-scaler 12000 \
-  --benchmark-max-systems 32 \
-  --benchmark-step-size 2 \
   --precision float32 \
   --electrode-reference-pristine default_structures/electrolyte_templates/Li.cif
 ```
@@ -121,7 +118,7 @@ These request one GPU by default and include a commented 4-GPU variant plus arra
 
 Recommended for production reruns on fixed manifests:
 - Persist and reuse `--max-memory-scaler` from a prior run.
-- Keep benchmark enabled for first calibration run, then use `--skip-batch-benchmark` for follow-up campaigns.
+- Keep a stable software stack and device type between calibration and reruns.
 
 ## 2PT Export
 
@@ -269,10 +266,9 @@ The workflow writes:
 - `merged/{features.csv,regression_summary.json,pred_vs_true.csv}`
 - `plots/*.png`
 
-Phase-level run metadata and optional benchmark artifacts:
+Phase-level run metadata artifacts:
 - `<output_dir>/uma_torchsim_screen/<phase>/run_config.json`
 - `<output_dir>/uma_torchsim_screen/<phase>/run_state.json`
-- `<output_dir>/uma_torchsim_screen/<phase>/batch_benchmark/batch_scaling.csv` (when benchmark enabled)
 
 Plot set includes MSD/fits, RDF, CN traces + histogram, residence proxy, oxygen species counts, vacancy metrics, predicted-vs-experimental, and faceted T/P heatmaps.
 

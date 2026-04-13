@@ -16,11 +16,5 @@ o_h_covalent_cutoff_A: 1.25
 li_o_cutoff_A: 2.6
 vacancy_site_match_cutoff_A: 1.0
 max_memory_scaler: null
-skip_batch_benchmark: false
-benchmark_steps: 40
-benchmark_warmup_steps: 5
-benchmark_max_systems: null
-benchmark_step_size: 1
-benchmark_temperature_k: 298.0
 precision: float32
 debug: false

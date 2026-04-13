@@ -462,7 +462,6 @@ def _build_config(args, phase: str, manifest_path: Path, model_name: str) -> Scr
     config.replicas = args.replicas
     config.base_seed = args.base_seed
     config.compute_stress = True
-    config.skip_batch_benchmark = args.skip_batch_benchmark
     config.max_memory_scaler = args.max_memory_scaler
     config.precision = args.precision
     config.debug = args.debug
@@ -531,7 +530,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-seed", type=int, default=0)
 
     parser.add_argument("--max-memory-scaler", type=float, default=None)
-    parser.add_argument("--skip-batch-benchmark", action="store_true")
     parser.add_argument("--debug", action="store_true")
 
     parser.add_argument("--run-2pt-backends", choices=["none", "cpp", "python", "both"], default="none")

@@ -39,12 +39,6 @@ class ScreenConfig:
     export_2pt: bool
     plots: bool
     max_memory_scaler: float | None
-    skip_batch_benchmark: bool
-    benchmark_steps: int
-    benchmark_warmup_steps: int
-    benchmark_max_systems: int | None
-    benchmark_step_size: int
-    benchmark_temperature_k: float
     precision: str
     debug: bool
 
@@ -89,12 +83,6 @@ def default_config() -> ScreenConfig:
         export_2pt=False,
         plots=False,
         max_memory_scaler=None,
-        skip_batch_benchmark=False,
-        benchmark_steps=40,
-        benchmark_warmup_steps=5,
-        benchmark_max_systems=None,
-        benchmark_step_size=1,
-        benchmark_temperature_k=298.0,
         precision="float32",
         debug=False,
     )
@@ -151,12 +139,6 @@ def parse_args_to_config(args) -> ScreenConfig:
     cfg.export_2pt = args.export_2pt
     cfg.plots = args.plots
     cfg.max_memory_scaler = args.max_memory_scaler
-    cfg.skip_batch_benchmark = args.skip_batch_benchmark
-    cfg.benchmark_steps = args.benchmark_steps
-    cfg.benchmark_warmup_steps = args.benchmark_warmup_steps
-    cfg.benchmark_max_systems = args.benchmark_max_systems
-    cfg.benchmark_step_size = args.benchmark_step_size
-    cfg.benchmark_temperature_k = args.benchmark_temperature_k
     cfg.precision = args.precision
     cfg.debug = args.debug
 
@@ -185,12 +167,6 @@ def parse_args_to_config(args) -> ScreenConfig:
         raise ValueError("--heat-start-temperature-k must be > 0")
     if cfg.production_stages <= 0:
         raise ValueError("--production-stages must be > 0")
-    if cfg.benchmark_steps <= 0:
-        raise ValueError("--benchmark-steps must be > 0")
-    if cfg.benchmark_warmup_steps < 0:
-        raise ValueError("--benchmark-warmup-steps must be >= 0")
-    if cfg.benchmark_step_size <= 0:
-        raise ValueError("--benchmark-step-size must be > 0")
     if cfg.precision not in {"float32", "float64"}:
         raise ValueError("--precision must be float32 or float64")
     return cfg
