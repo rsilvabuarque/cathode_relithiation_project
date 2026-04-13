@@ -13,9 +13,9 @@ hrw-uma-torchsim-chem-potential --help
 Given either an input structure directory or a manifest, it can:
 
 1. Build a phase manifest for all structures and default/custom temperature-pressure combos.
-2. Run TorchSim UMA MD (`NPT` rethermalization + `NVT` production) with batched single-GPU execution.
+2. Run TorchSim UMA MD with a four-stage sequence: energy minimization, NVT heating ramp, NPT equilibration, and staged NVT production.
 3. Export 2PT-ready artifacts from TorchSim outputs.
-4. Generate py2pt `.ini` and `.grps` files per replica and run py2pt.
+4. Generate py2pt `.ini` and `.grps` files per production segment and run py2pt.
 5. Produce summary plots:
    - `master_thermo_evolution_all_runs.png`
    - `master_final_stats_vs_concentration.png` (electrolyte)
@@ -59,11 +59,27 @@ hrw-uma-torchsim-chem-potential \
   --system-type electrolyte \
   --input-dir /path/to/electrolyte_structures \
   --output-dir runs/uma_chem_potential \
-  --replicas 15 \
   --device cuda \
   --model-name uma-s-1p2 \
   --py2pt-command py2pt
 ```
+
+## Default MD schedule
+
+For each condition, default stage settings are:
+
+1. Energy minimization: `--minimize-steps 2000`
+2. NVT heating from `1 K` to target temperature: `--heat-steps 10000`
+3. NPT equilibration at target temperature/pressure: `--npt-equil-steps 50000`
+4. NVT production: `--nvt-prod-steps 100000` split into `--production-stages 5` (20,000 steps per stage)
+
+Default dump cadence is `--dump-every-steps 4`, which is used for thermo/trajectory reporting and 2PT exports.
+
+`--replicas` is retained only for backward compatibility and must stay at `1` in this workflow.
+
+The top-level `* MD system-steps` progress bar reports planned aggregate work:
+
+- `n_conditions * (minimize + heat + npt + production)`
 
 ## Publication-classical full-MD runs
 
@@ -86,7 +102,6 @@ hrw-uma-torchsim-chem-potential \
   --input-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/classical_forcefield/final_data_files \
   --output-dir runs/publication/uma_chem_potential_electrolyte \
   --device cuda \
-  --replicas 15 \
   --model-name uma-s-1p2 \
   --py2pt-command py2pt \
   --py2pt-workers "$(nproc)"
@@ -100,7 +115,6 @@ hrw-uma-torchsim-chem-potential \
   --input-dir results/publication/default_systems/electrode/LCO_mp-22526/classical_forcefield/POSCAR_directory \
   --output-dir runs/publication/uma_chem_potential_electrode \
   --device cuda \
-  --replicas 15 \
   --model-name uma-s-1p2 \
   --py2pt-command py2pt \
   --py2pt-workers "$(nproc)"

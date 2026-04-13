@@ -363,7 +363,9 @@ def _build_config(args: argparse.Namespace, system_type: str, manifest_path: Pat
     cfg.retherm_steps_electrolyte = cfg.retherm_steps_electrode
     cfg.prod_steps = int(args.nvt_prod_steps)
     cfg.production_stages = int(args.production_stages)
-    cfg.replicas = args.replicas
+    # This workflow runs one MD realization per structure. Production segmentation
+    # is controlled by --production-stages and does not imply replica reruns.
+    cfg.replicas = 1
     cfg.base_seed = args.base_seed
     cfg.compute_stress = True
     cfg.max_memory_scaler = args.max_memory_scaler
@@ -442,6 +444,7 @@ def _write_py2pt_ini(
     out_ini: Path,
     *,
     trajectory_name: str,
+    thermo_name: str = "prod_thermo.csv",
     group_name: str,
     timestep_ps: float,
     prefix: str,
@@ -453,7 +456,7 @@ def _write_py2pt_ini(
         "[files]",
         f"trajectory = {trajectory_name}",
         "trajectory_format = TORCHSIM",
-        "thermo_file = prod_thermo.csv",
+        f"thermo_file = {thermo_name}",
         f"group_file = {group_name}",
     ]
     if topology_path:
@@ -586,57 +589,77 @@ def _prepare_py2pt_jobs(
             continue
         rep_dirs = sorted(path for path in cond_dir.iterdir() if path.is_dir() and path.name.startswith("replica_"))
         for rep_dir in rep_dirs:
-            h5md = rep_dir / "prod.h5md"
-            thermo_csv = rep_dir / "prod_thermo.csv"
-            if not (h5md.exists() and thermo_csv.exists()):
-                skipped.append(
-                    {
-                        "condition_id": condition_id,
-                        "replica": rep_dir.name,
-                        "status": "missing_prod_files",
-                    }
-                )
-                continue
-
             rep_num = int(rep_dir.name.split("_")[-1]) + 1
-            stem = f"lammps_2pt_py2pt.{rep_num}"
-            grps = rep_dir / f"{stem}.grps"
-            has_li = _write_py2pt_group_file(h5md, grps)
-            if not has_li:
-                skipped.append(
-                    {
-                        "condition_id": condition_id,
-                        "replica": rep_dir.name,
-                        "status": "no_li_atoms",
-                    }
-                )
-                continue
+            segment_jobs: list[tuple[str, Path, Path]] = []
+            staged_h5md = sorted(rep_dir.glob("prod_2pt_*.h5md"))
+            if staged_h5md:
+                for segment_h5 in staged_h5md:
+                    segment_thermo = rep_dir / f"{segment_h5.stem}_thermo.csv"
+                    if not segment_thermo.exists():
+                        skipped.append(
+                            {
+                                "condition_id": condition_id,
+                                "replica": f"{rep_dir.name}/{segment_h5.stem}",
+                                "status": "missing_segment_thermo",
+                            }
+                        )
+                        continue
+                    segment_jobs.append((segment_h5.stem, segment_h5, segment_thermo))
 
-            ini = rep_dir / f"{stem}.ini"
-            prefix = f"2pt_output/{stem}"
+            if not segment_jobs:
+                h5md = rep_dir / "prod.h5md"
+                thermo_csv = rep_dir / "prod_thermo.csv"
+                if not (h5md.exists() and thermo_csv.exists()):
+                    skipped.append(
+                        {
+                            "condition_id": condition_id,
+                            "replica": rep_dir.name,
+                            "status": "missing_prod_files",
+                        }
+                    )
+                    continue
+                segment_jobs = [("prod", h5md, thermo_csv)]
+
             topology_path, topology_format = _infer_topology_for_py2pt(row.get("structure_path"))
             use_molecular_mode = system_type == "electrolyte" and topology_path is not None
-            _write_py2pt_ini(
-                ini,
-                trajectory_name=h5md.name,
-                group_name=grps.name,
-                timestep_ps=timestep_ps,
-                prefix=prefix,
-                mode=4 if use_molecular_mode else 1,
-                topology_path=topology_path,
-                topology_format=topology_format,
-            )
-            jobs.append(
-                Py2PTJob(
-                    condition_id=condition_id,
-                    replica_dir=rep_dir,
-                    replica_index=rep_num,
-                    ini_path=ini,
+            for segment_name, h5md, thermo_csv in segment_jobs:
+                stem = f"lammps_2pt_py2pt.{rep_num}.{segment_name}"
+                grps = rep_dir / f"{stem}.grps"
+                has_li = _write_py2pt_group_file(h5md, grps)
+                if not has_li:
+                    skipped.append(
+                        {
+                            "condition_id": condition_id,
+                            "replica": f"{rep_dir.name}/{segment_name}",
+                            "status": "no_li_atoms",
+                        }
+                    )
+                    continue
+
+                ini = rep_dir / f"{stem}.ini"
+                prefix = f"2pt_output/{stem}"
+                _write_py2pt_ini(
+                    ini,
+                    trajectory_name=h5md.name,
+                    thermo_name=thermo_csv.name,
+                    group_name=grps.name,
+                    timestep_ps=timestep_ps,
                     prefix=prefix,
-                    thermo_path=rep_dir / f"{prefix}.thermo",
-                    run_row=row,
+                    mode=4 if use_molecular_mode else 1,
+                    topology_path=topology_path,
+                    topology_format=topology_format,
                 )
-            )
+                jobs.append(
+                    Py2PTJob(
+                        condition_id=condition_id,
+                        replica_dir=rep_dir,
+                        replica_index=rep_num,
+                        ini_path=ini,
+                        prefix=prefix,
+                        thermo_path=rep_dir / f"{prefix}.thermo",
+                        run_row=row,
+                    )
+                )
 
     return jobs, skipped
 
@@ -696,7 +719,7 @@ def _run_py2pt_phase(args: argparse.Namespace, manifest_rows: list[dict[str, str
                 }
             )
 
-    return sorted(results, key=lambda r: (r.condition_id, r.replica_dir.name))
+    return sorted(results, key=lambda r: (r.condition_id, r.replica_dir.name, r.thermo_path.name))
 
 
 def _safe_float(text: str | None) -> float | None:
@@ -1160,12 +1183,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimize-steps", type=int, default=2000)
     parser.add_argument("--heat-steps", type=int, default=10000)
     parser.add_argument("--heat-start-temperature-k", type=float, default=1.0)
-    parser.add_argument("--npt-equil-steps", type=int, default=100000)
+    parser.add_argument("--npt-equil-steps", type=int, default=50000)
     parser.add_argument("--nvt-prod-steps", type=int, default=100000)
-    parser.add_argument("--production-stages", type=int, default=15)
+    parser.add_argument("--production-stages", type=int, default=5)
     parser.add_argument("--timestep-ps", type=float, default=0.001)
-    parser.add_argument("--dump-every-steps", type=int, default=2)
-    parser.add_argument("--replicas", type=int, default=15)
+    parser.add_argument("--dump-every-steps", type=int, default=4)
+    parser.add_argument(
+        "--replicas",
+        type=int,
+        default=1,
+        help="Deprecated in this workflow; must be 1. Use --production-stages to split NVT production for 2PT.",
+    )
     parser.add_argument("--base-seed", type=int, default=0)
 
     parser.add_argument("--max-memory-scaler", type=float, default=None)
@@ -1187,6 +1215,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     args.output_dir = args.output_dir.resolve()
+
+    if int(args.replicas) != 1:
+        raise ValueError(
+            "--replicas is no longer used for hrw-uma-torchsim-chem-potential and must be 1. "
+            "Use --production-stages to split production into multiple 2PT trajectories/logs."
+        )
 
     run_root = args.output_dir / "uma_torchsim_screen"
     run_root.mkdir(parents=True, exist_ok=True)

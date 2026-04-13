@@ -488,9 +488,9 @@ hrw-uma-torchsim-chem-potential --help
 
 Purpose:
 
-- Run TorchSim UMA MD (`NPT` rethermalization + `NVT` production) for electrode or electrolyte campaigns.
+- Run TorchSim UMA MD (energy minimization, NVT heating, NPT equilibration, staged NVT production) for electrode or electrolyte campaigns.
 - Accept mixed structure inputs from one directory (`POSCAR*`, `.data`/`.lammps`/`.lmp`, `.cif`, `.bgf`, plus `.xyz`/`.extxyz`/`.vasp`/`.pdb`).
-- Generate and run py2pt jobs for each replica using TorchSim trajectories and logs.
+- Generate and run py2pt jobs for staged production trajectories/logs from each structure run.
 - Produce publication-style summary outputs including:
   - `master_thermo_evolution_all_runs.png`
   - `master_final_stats_vs_concentration.png` / `master_final_stats_vs_lithiation.png`
@@ -516,7 +516,6 @@ hrw-uma-torchsim-chem-potential \
   --input-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/classical_forcefield/final_data_files \
   --output-dir runs/publication/uma_chem_potential_electrolyte \
   --device cuda \
-  --replicas 15 \
   --py2pt-workers "$(nproc)"
 
 # Electrode: publication POSCAR directory
@@ -525,7 +524,6 @@ hrw-uma-torchsim-chem-potential \
   --input-dir results/publication/default_systems/electrode/LCO_mp-22526/classical_forcefield/POSCAR_directory \
   --output-dir runs/publication/uma_chem_potential_electrode \
   --device cuda \
-  --replicas 15 \
   --py2pt-workers "$(nproc)"
 ```
 
