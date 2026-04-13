@@ -49,3 +49,23 @@ def test_write_py2pt_group_file_from_h5md(tmp_path: Path) -> None:
     assert "[group1]" in text
     assert "atoms = 1" in text
     assert "[group2]" in text
+
+
+def test_extract_aq_group_total_direct_layout(tmp_path: Path) -> None:
+    thermo_path = tmp_path / "sample.thermo"
+    thermo_path.write_text(
+        "A_q (kJ/mol/atom) -19987.222 -84057.795 -83305.821\n",
+        encoding="utf-8",
+    )
+    assert wf._extract_aq_group_total(thermo_path, group_idx=1) == pytest.approx(-19987.222)
+    assert wf._extract_aq_group_total(thermo_path, group_idx=2) == pytest.approx(-84057.795)
+
+
+def test_extract_aq_group_total_legacy_layout(tmp_path: Path) -> None:
+    thermo_path = tmp_path / "legacy.thermo"
+    thermo_path.write_text(
+        "A_q -1 -2 -3 -4 -5 -6 -7 -8\n",
+        encoding="utf-8",
+    )
+    # Legacy parser expects the total term at index 4*(group_idx-1)+3.
+    assert wf._extract_aq_group_total(thermo_path, group_idx=2) == pytest.approx(-8.0)

@@ -332,9 +332,13 @@ def _build_config(args: argparse.Namespace, system_type: str, manifest_path: Pat
     cfg.ensemble = "nvt"
     cfg.timestep_ps = args.timestep_ps
     cfg.dump_every_steps = args.dump_every_steps
-    cfg.retherm_steps_electrode = _steps_from_fs(args.npt_equil_fs, args.timestep_ps)
+    cfg.minimize_steps = int(args.minimize_steps)
+    cfg.heat_steps = int(args.heat_steps)
+    cfg.heat_start_temperature_k = float(args.heat_start_temperature_k)
+    cfg.retherm_steps_electrode = int(args.npt_equil_steps)
     cfg.retherm_steps_electrolyte = cfg.retherm_steps_electrode
-    cfg.prod_steps = _steps_from_fs(args.nvt_prod_fs, args.timestep_ps)
+    cfg.prod_steps = int(args.nvt_prod_steps)
+    cfg.production_stages = int(args.production_stages)
     cfg.replicas = args.replicas
     cfg.base_seed = args.base_seed
     cfg.compute_stress = True
@@ -448,17 +452,20 @@ def _write_py2pt_ini(
 
 
 def _extract_aq_group_total(thermo_path: Path, group_idx: int) -> float:
-    target_pos = 4 * (group_idx - 1) + 3
+    legacy_target_pos = 4 * (group_idx - 1) + 3
     with thermo_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
             if not line.lstrip().startswith("A_q"):
                 continue
             values = [float(tok) for tok in FLOAT_RE.findall(line)]
-            if target_pos >= len(values):
-                raise ValueError(
-                    f"{thermo_path}: A_q row has {len(values)} numbers, cannot index group {group_idx}"
-                )
-            return float(values[target_pos])
+            if legacy_target_pos < len(values):
+                return float(values[legacy_target_pos])
+            direct_idx = group_idx - 1
+            if direct_idx < len(values):
+                return float(values[direct_idx])
+            raise ValueError(
+                f"{thermo_path}: A_q row has {len(values)} numbers, cannot index group {group_idx}"
+            )
     raise ValueError(f"{thermo_path}: A_q row not found")
 
 
@@ -999,9 +1006,13 @@ def _generate_slurm_scripts(args: argparse.Namespace, manifest_path: Path, manif
             f"--replicas {args.replicas} "
             f"--timestep-ps {args.timestep_ps} "
             f"--dump-every-steps {args.dump_every_steps} "
-            f"--retherm-steps-electrode {_steps_from_fs(args.npt_equil_fs, args.timestep_ps)} "
-            f"--retherm-steps-electrolyte {_steps_from_fs(args.npt_equil_fs, args.timestep_ps)} "
-            f"--prod-steps {_steps_from_fs(args.nvt_prod_fs, args.timestep_ps)} "
+            f"--minimize-steps {args.minimize_steps} "
+            f"--heat-steps {args.heat_steps} "
+            f"--heat-start-temperature-k {args.heat_start_temperature_k} "
+            f"--retherm-steps-electrode {args.npt_equil_steps} "
+            f"--retherm-steps-electrolyte {args.npt_equil_steps} "
+            f"--prod-steps {args.nvt_prod_steps} "
+            f"--production-stages {args.production_stages} "
             f"{'--skip-batch-benchmark' if args.skip_batch_benchmark else ''} "
             f"{f'--max-memory-scaler {args.max_memory_scaler}' if args.max_memory_scaler is not None else ''}\n"
         )
@@ -1082,8 +1093,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--precision", choices=["float32", "float64"], default="float32")
 
-    parser.add_argument("--npt-equil-fs", type=int, default=500000)
-    parser.add_argument("--nvt-prod-fs", type=int, default=100000)
+    parser.add_argument("--minimize-steps", type=int, default=2000)
+    parser.add_argument("--heat-steps", type=int, default=10000)
+    parser.add_argument("--heat-start-temperature-k", type=float, default=1.0)
+    parser.add_argument("--npt-equil-steps", type=int, default=100000)
+    parser.add_argument("--nvt-prod-steps", type=int, default=100000)
+    parser.add_argument("--production-stages", type=int, default=15)
     parser.add_argument("--timestep-ps", type=float, default=0.001)
     parser.add_argument("--dump-every-steps", type=int, default=2)
     parser.add_argument("--replicas", type=int, default=15)
