@@ -124,6 +124,20 @@ def _extract_li_k_conc(path: Path) -> tuple[float | None, float | None]:
     return li, k
 
 
+def _is_lammps_data_path(path: Path) -> bool:
+    ext = path.suffix.lower()
+    if ext in {".data", ".lammps", ".lmp"}:
+        return True
+    name_lower = path.name.lower()
+    if name_lower == "data":
+        return True
+    # Publication electrolyte files use names like data.LiOH_2p0_KOH_2p0_seed01.
+    # Treat these as LAMMPS data unless they carry another known supported extension.
+    if name_lower.startswith("data.") and ext not in SUPPORTED_EXTS:
+        return True
+    return False
+
+
 def _discover_structure_files(root: Path) -> list[Path]:
     if not root.exists():
         raise FileNotFoundError(f"Input directory not found: {root}")
@@ -132,6 +146,9 @@ def _discover_structure_files(root: Path) -> list[Path]:
         if not path.is_file():
             continue
         if path.name.upper().startswith("POSCAR"):
+            out.append(path)
+            continue
+        if _is_lammps_data_path(path):
             out.append(path)
             continue
         if path.suffix.lower() in SUPPORTED_EXTS:
@@ -180,7 +197,7 @@ def _read_structure_any(path: Path) -> Atoms:
 
     if name_upper.startswith("POSCAR") or ext == ".vasp":
         return ase_read(path, format="vasp")
-    if ext in {".data", ".lammps", ".lmp"}:
+    if _is_lammps_data_path(path):
         return ase_read(path, format="lammps-data")
     if ext == ".bgf":
         try:

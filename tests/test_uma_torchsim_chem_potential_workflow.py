@@ -107,3 +107,30 @@ def test_extract_li_k_conc_parses_publication_p_tokens() -> None:
 def test_extract_lithiation_parses_poscar_milli_suffix() -> None:
     lith = wf._extract_lithiation(Path("POSCAR_000451"))
     assert lith == pytest.approx(0.451)
+
+
+def test_discover_structure_files_supports_publication_lammps_names(tmp_path: Path) -> None:
+    data_path = tmp_path / "data.LiOH_2p0_KOH_2p0_seed01"
+    data_path.write_text("LAMMPS data\n", encoding="utf-8")
+
+    files = wf._discover_structure_files(tmp_path)
+    assert files == [data_path]
+
+
+def test_read_structure_any_publication_lammps_name_uses_lammps_reader(monkeypatch, tmp_path: Path) -> None:
+    data_path = tmp_path / "data.LiOH_3p2_KOH_0p8_seed01"
+    data_path.write_text("LAMMPS data\n", encoding="utf-8")
+
+    observed: dict[str, object] = {}
+
+    def _fake_ase_read(path, format=None):
+        observed["path"] = path
+        observed["format"] = format
+        return "sentinel"
+
+    monkeypatch.setattr(wf, "ase_read", _fake_ase_read)
+    result = wf._read_structure_any(data_path)
+
+    assert result == "sentinel"
+    assert observed["path"] == data_path
+    assert observed["format"] == "lammps-data"
