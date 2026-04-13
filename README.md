@@ -243,38 +243,6 @@ Analysis outputs include:
 
 The lithiation plots show all points with transparency plus mean±std overlays at each lithiation percentage.
 
-## Electrolyte post-generation VASP workflow (prepare → submit/status)
-
-New command:
-
-```bash
-hrw-electrolyte-vasp-workflow --help
-```
-
-Subcommands:
-
-- `prepare-inputs`: build per-structure SCF case folders from electrolyte `best_training_set`
-- `submit`: submit pending (and optionally fizzled) cases via `sbatch`
-- `status`: classify `completed/running/fizzled/pending`
-
-Template-driven case preparation for the publication electrolyte default system:
-
-```bash
-hrw-electrolyte-vasp-workflow prepare-inputs \
-  --structures-root results/publication/default_systems/electrolyte/LiOH_KOH_H2O/structure_generation \
-  --template-dir for_chat_gpt/VASP_input_templates_for_new_experiment_electrolyte \
-  --output-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/structure_generation/vasp_workflow
-```
-
-Generated case layout:
-
-```text
-<output_dir>/cases/<case_id>/
-  POSCAR INCAR KPOINTS [POTCAR|POTCAR.spec] run_vasp.slurm run_manifest.json
-```
-
-Each case manifest stores parsed electrolyte metadata (`temperature_k`, `concentration_label`, `li_molality`, `k_molality`) from directory labels like `T_393K/LiOH_2.00_KOH_2.00/structure_000069.cif`.
-
 ## UMA fine-tuning from `vasp_workflow` outputs (omat)
 
 New command:
@@ -508,6 +476,35 @@ Backbone utility command (works before full generation internals exist):
 
 ```bash
 hrw-electrode-generate --bootstrap-output-tree
+```
+
+## UMA TorchSim chemical-potential workflow
+
+New command:
+
+```bash
+hrw-uma-torchsim-chem-potential --help
+```
+
+Purpose:
+
+- Run TorchSim UMA MD (`NPT` rethermalization + `NVT` production) for electrode or electrolyte campaigns.
+- Accept mixed structure inputs from one directory (`POSCAR*`, `.data`/`.lammps`/`.lmp`, `.cif`, `.bgf`, plus `.xyz`/`.extxyz`/`.vasp`/`.pdb`).
+- Generate and run py2pt jobs for each replica using TorchSim trajectories and logs.
+- Produce publication-style summary outputs including:
+  - `master_thermo_evolution_all_runs.png`
+  - `master_final_stats_vs_concentration.png` / `master_final_stats_vs_lithiation.png`
+  - `li_chemical_potential_vs_concentration.png` / `li_chemical_potential_vs_lithiation.png`
+- Optionally generate per-condition Slurm scripts for MD plus postprocessing scripts for py2pt and plots.
+
+See full usage in:
+
+- `docs/uma_torchsim_chem_potential_workflow.md`
+
+Install fork-pinned dependencies for this experiment with:
+
+```bash
+pip install ".[uma-forks]"
 ```
 
 ## Quick start

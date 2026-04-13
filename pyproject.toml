@@ -27,6 +27,14 @@ dependencies = [
 matgl-dgl = [
   "dgl>=2.2.0,<2.5",
 ]
+two-pt = [
+  "py2pt",
+]
+uma-forks = [
+  "fairchem-core @ git+https://github.com/rsilvabuarque/fairchem.git@feature/uma-per-atom-energy-inference#subdirectory=packages/fairchem-core",
+  "torch-sim-atomistic[fairchem] @ git+https://github.com/rsilvabuarque/torch-sim.git@feature/per-atom-energy-reporting",
+  "py2pt @ git+https://github.com/rsilvabuarque/py2pt.git@main",
+]
 dev = [
   "pytest",
   "ruff",
@@ -43,6 +51,7 @@ hrw-uma-torchsim-screen = "hydrorelith.pipelines.uma_torchsim_screen:main"
 hrw-uma-torchsim-analyze = "hydrorelith.pipelines.uma_torchsim_screen:main_analyze"
 hrw-uma-torchsim-export2pt = "hydrorelith.pipelines.uma_torchsim_screen:main_export2pt"
 hrw-uma-torchsim-2pt-experiment = "hydrorelith.pipelines.uma_torchsim_2pt_experiment:main"
+hrw-uma-torchsim-chem-potential = "hydrorelith.pipelines.uma_torchsim_chem_potential_workflow:main"
 hrw-uma-water-2pt-experiment = "hydrorelith.pipelines.uma_water_2pt_experiment:main"
 hrw-uma-torchsim-manifest-template = "hydrorelith.io.structure_manifest:main_template"
 hrw-uma-finetune-vasp-workflow = "hydrorelith.pipelines.uma_finetune_vasp_workflow:main"

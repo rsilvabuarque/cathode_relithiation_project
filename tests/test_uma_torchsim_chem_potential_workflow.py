@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from hydrorelith.pipelines import uma_torchsim_chem_potential_workflow as wf
+
+
+def test_parse_tp_combos_default_like_string() -> None:
+    combos = wf._parse_tp_combos("220:2.02,200:1.32,160:0.46,120:0.08")
+    assert combos == [(220.0, 2.02), (200.0, 1.32), (160.0, 0.46), (120.0, 0.08)]
+
+
+def test_build_manifest_rows_electrolyte_fields(tmp_path: Path) -> None:
+    prepared = [
+        wf.PreparedStructure(
+            source_path=tmp_path / "source.cif",
+            prepared_path=tmp_path / "prepared.extxyz",
+            condition_label="sample",
+            lithiation_fraction=None,
+            lioh_m=2.0,
+            koh_m=2.0,
+        )
+    ]
+    rows = wf._build_manifest_rows("electrolyte", prepared, [(120.0, 0.08)])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["phase"] == "electrolyte"
+    assert row["task_name"] == "omol"
+    assert row["liOH_M"] == "2"
+    assert row["kOH_M"] == "2"
+    assert row["condition_id"].startswith("el_t393k_p0p08mpa")
+
+
+def test_write_py2pt_group_file_from_h5md(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+
+    h5_path = tmp_path / "prod.h5md"
+    with h5py.File(h5_path, "w") as h5:
+        h5.create_dataset("atomic_numbers", data=np.array([3, 8, 1, 1], dtype=int))
+
+    group_path = tmp_path / "groups.grps"
+    has_li = wf._write_py2pt_group_file(h5_path, group_path)
+
+    assert has_li is True
+    text = group_path.read_text(encoding="utf-8")
+    assert "[group1]" in text
+    assert "atoms = 1" in text
+    assert "[group2]" in text
