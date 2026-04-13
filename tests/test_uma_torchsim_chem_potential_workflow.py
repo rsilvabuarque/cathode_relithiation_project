@@ -96,3 +96,14 @@ def test_infer_topology_for_py2pt_lammps_data(tmp_path: Path) -> None:
     topo, fmt = wf._infer_topology_for_py2pt(str(data_path))
     assert topo == str(data_path)
     assert fmt == "LAMMPS"
+
+
+def test_extract_li_k_conc_parses_publication_p_tokens() -> None:
+    li, k = wf._extract_li_k_conc(Path("data.LiOH_3p2_KOH_0p8_seed01"))
+    assert li == pytest.approx(3.2)
+    assert k == pytest.approx(0.8)
+
+
+def test_extract_lithiation_parses_poscar_milli_suffix() -> None:
+    lith = wf._extract_lithiation(Path("POSCAR_000451"))
+    assert lith == pytest.approx(0.451)

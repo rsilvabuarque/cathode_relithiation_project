@@ -65,6 +65,47 @@ hrw-uma-torchsim-chem-potential \
   --py2pt-command py2pt
 ```
 
+## Publication-classical full-MD runs
+
+The repository now includes clone-visible publication input structures under:
+
+- `results/publication/default_systems/electrolyte/LiOH_KOH_H2O/classical_forcefield/final_data_files`
+- `results/publication/default_systems/electrode/LCO_mp-22526/classical_forcefield/POSCAR_directory`
+
+Use the commands below to run MD plus py2pt with maximum practical parallelism on a single node:
+
+- Keep MD enabled by not passing `--skip-md`.
+- Keep TorchSim GPU autobatch benchmarking enabled by not passing `--skip-batch-benchmark`.
+- Use all visible CPU cores for py2pt via `--py2pt-workers "$(nproc)"`.
+
+Electrolyte (publication classical data files):
+
+```bash
+hrw-uma-torchsim-chem-potential \
+  --system-type electrolyte \
+  --input-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/classical_forcefield/final_data_files \
+  --output-dir runs/publication/uma_chem_potential_electrolyte \
+  --device cuda \
+  --replicas 15 \
+  --model-name uma-s-1p2 \
+  --py2pt-command py2pt \
+  --py2pt-workers "$(nproc)"
+```
+
+Electrode (publication POSCAR directory):
+
+```bash
+hrw-uma-torchsim-chem-potential \
+  --system-type electrode \
+  --input-dir results/publication/default_systems/electrode/LCO_mp-22526/classical_forcefield/POSCAR_directory \
+  --output-dir runs/publication/uma_chem_potential_electrode \
+  --device cuda \
+  --replicas 15 \
+  --model-name uma-s-1p2 \
+  --py2pt-command py2pt \
+  --py2pt-workers "$(nproc)"
+```
+
 ## Slurm-generation mode
 
 To generate per-condition MD scripts plus postprocessing scripts:

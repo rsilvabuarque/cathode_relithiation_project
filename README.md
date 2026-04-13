@@ -507,6 +507,28 @@ Install fork-pinned dependencies for this experiment with:
 pip install ".[uma-forks]"
 ```
 
+Publication-classical full-MD examples (clone-visible inputs tracked in `results/publication/default_systems/...`):
+
+```bash
+# Electrolyte: publication classical force-field data files
+hrw-uma-torchsim-chem-potential \
+  --system-type electrolyte \
+  --input-dir results/publication/default_systems/electrolyte/LiOH_KOH_H2O/classical_forcefield/final_data_files \
+  --output-dir runs/publication/uma_chem_potential_electrolyte \
+  --device cuda \
+  --replicas 15 \
+  --py2pt-workers "$(nproc)"
+
+# Electrode: publication POSCAR directory
+hrw-uma-torchsim-chem-potential \
+  --system-type electrode \
+  --input-dir results/publication/default_systems/electrode/LCO_mp-22526/classical_forcefield/POSCAR_directory \
+  --output-dir runs/publication/uma_chem_potential_electrode \
+  --device cuda \
+  --replicas 15 \
+  --py2pt-workers "$(nproc)"
+```
+
 ## Quick start
 
 ```bash

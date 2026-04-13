@@ -101,6 +101,13 @@ def _extract_lithiation(path: Path) -> float | None:
     match = re.search(r"lith[_-]?(?P<pct>\d+(?:\.\d+)?)pct", token, flags=re.IGNORECASE)
     if match:
         return float(match.group("pct")) / 100.0
+    # Publication electrode inputs include POSCAR_000451-style labels.
+    # Interpret the numeric suffix as milli-fractional lithiation (0.451 here).
+    match = re.search(r"POSCAR[_-]0*(?P<milli>\d{3,4})(?:\D|$)", path.name, flags=re.IGNORECASE)
+    if match:
+        value = float(match.group("milli")) / 1000.0
+        if 0.0 <= value <= 1.0:
+            return value
     return None
 
 
@@ -108,12 +115,12 @@ def _extract_li_k_conc(path: Path) -> tuple[float | None, float | None]:
     token = path.as_posix()
     li = None
     k = None
-    m_li = re.search(r"LiOH[_-]?(\d+(?:\.\d+)?)", token, flags=re.IGNORECASE)
-    m_k = re.search(r"KOH[_-]?(\d+(?:\.\d+)?)", token, flags=re.IGNORECASE)
+    m_li = re.search(r"LiOH[_-]?(\d+(?:[p\.]\d+)?)", token, flags=re.IGNORECASE)
+    m_k = re.search(r"KOH[_-]?(\d+(?:[p\.]\d+)?)", token, flags=re.IGNORECASE)
     if m_li:
-        li = float(m_li.group(1))
+        li = float(m_li.group(1).replace("p", "."))
     if m_k:
-        k = float(m_k.group(1))
+        k = float(m_k.group(1).replace("p", "."))
     return li, k
 
 
