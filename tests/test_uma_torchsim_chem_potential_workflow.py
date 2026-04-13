@@ -69,3 +69,30 @@ def test_extract_aq_group_total_legacy_layout(tmp_path: Path) -> None:
     )
     # Legacy parser expects the total term at index 4*(group_idx-1)+3.
     assert wf._extract_aq_group_total(thermo_path, group_idx=2) == pytest.approx(-8.0)
+
+
+def test_write_py2pt_ini_molecular_with_topology(tmp_path: Path) -> None:
+    ini_path = tmp_path / "sample.ini"
+    wf._write_py2pt_ini(
+        ini_path,
+        trajectory_name="prod.h5md",
+        group_name="groups.grps",
+        timestep_ps=0.001,
+        prefix="2pt_output/sample",
+        mode=4,
+        topology_path="/tmp/system.data",
+        topology_format="LAMMPS",
+    )
+
+    text = ini_path.read_text(encoding="utf-8")
+    assert "topology = /tmp/system.data" in text
+    assert "topology_format = LAMMPS" in text
+    assert "mode = 4" in text
+
+
+def test_infer_topology_for_py2pt_lammps_data(tmp_path: Path) -> None:
+    data_path = tmp_path / "system.data"
+    data_path.write_text("header\n", encoding="utf-8")
+    topo, fmt = wf._infer_topology_for_py2pt(str(data_path))
+    assert topo == str(data_path)
+    assert fmt == "LAMMPS"

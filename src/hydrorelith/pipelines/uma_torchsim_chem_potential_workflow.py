@@ -422,33 +422,69 @@ def _write_py2pt_ini(
     group_name: str,
     timestep_ps: float,
     prefix: str,
+    mode: int = 1,
+    topology_path: str | None = None,
+    topology_format: str | None = None,
 ) -> None:
+    files_block = [
+        "[files]",
+        f"trajectory = {trajectory_name}",
+        "trajectory_format = TORCHSIM",
+        "thermo_file = prod_thermo.csv",
+        f"group_file = {group_name}",
+    ]
+    if topology_path:
+        files_block.insert(1, f"topology = {topology_path}")
+        if topology_format:
+            files_block.insert(2, f"topology_format = {topology_format}")
+
     text = (
-        "[files]\n"
-        f"trajectory = {trajectory_name}\n"
-        "trajectory_format = TORCHSIM\n"
-        "thermo_file = prod_thermo.csv\n"
-        f"group_file = {group_name}\n\n"
-        "[frames]\n"
-        "start = 1\n"
-        "stop = 0\n"
-        "step = 1\n\n"
-        "[analysis]\n"
-        "corlen = 0.5\n"
-        "mode = 1\n"
-        "vel_scale = 1.0\n"
-        "lammps_units = metal\n"
-        "check_grp_eng = false\n\n"
-        "[thermodynamics]\n"
-        f"timestep = {timestep_ps:.12g}\n\n"
-        "[output]\n"
-        f"prefix = {prefix}\n"
-        "show_2pt_split = false\n"
-        "normalize = true\n"
-        "out_units = kj/mol\n"
+        "\n".join(files_block)
+        + "\n\n"
+        + "[frames]\n"
+        + "start = 1\n"
+        + "stop = 0\n"
+        + "step = 1\n\n"
+        + "[analysis]\n"
+        + "corlen = 0.5\n"
+        + f"mode = {int(mode)}\n"
+        + "vel_scale = 1.0\n"
+        + "lammps_units = metal\n"
+        + "check_grp_eng = false\n\n"
+        + "[thermodynamics]\n"
+        + f"timestep = {timestep_ps:.12g}\n\n"
+        + "[output]\n"
+        + f"prefix = {prefix}\n"
+        + "show_2pt_split = false\n"
+        + "normalize = true\n"
+        + "out_units = kj/mol\n"
     )
     out_ini.parent.mkdir(parents=True, exist_ok=True)
     out_ini.write_text(text, encoding="utf-8")
+
+
+def _infer_topology_for_py2pt(structure_path: str | None) -> tuple[str | None, str | None]:
+    if not structure_path:
+        return (None, None)
+
+    path = Path(structure_path).expanduser()
+    if not path.exists():
+        return (None, None)
+
+    suffix = path.suffix.lower()
+    fmt = {
+        ".data": "LAMMPS",
+        ".lmpdata": "LAMMPS",
+        ".bgf": "BGF",
+        ".pdb": "PDB",
+        ".gro": "GRO",
+        ".psf": "PSF",
+        ".prmtop": "AMBER",
+        ".parm7": "AMBER",
+    }.get(suffix)
+    if fmt is None:
+        return (None, None)
+    return (str(path), fmt)
 
 
 def _extract_aq_group_total(thermo_path: Path, group_idx: int) -> float:
@@ -514,6 +550,7 @@ def _prepare_py2pt_jobs(
     phase_root: Path,
     manifest_rows: list[dict[str, str]],
     timestep_ps: float,
+    system_type: str,
 ) -> tuple[list[Py2PTJob], list[dict[str, str]]]:
     row_by_condition = {row["condition_id"]: row for row in manifest_rows}
     jobs: list[Py2PTJob] = []
@@ -554,12 +591,17 @@ def _prepare_py2pt_jobs(
 
             ini = rep_dir / f"{stem}.ini"
             prefix = f"2pt_output/{stem}"
+            topology_path, topology_format = _infer_topology_for_py2pt(row.get("structure_path"))
+            use_molecular_mode = system_type == "electrolyte" and topology_path is not None
             _write_py2pt_ini(
                 ini,
                 trajectory_name=h5md.name,
                 group_name=grps.name,
                 timestep_ps=timestep_ps,
                 prefix=prefix,
+                mode=4 if use_molecular_mode else 1,
+                topology_path=topology_path,
+                topology_format=topology_format,
             )
             jobs.append(
                 Py2PTJob(
@@ -578,7 +620,7 @@ def _prepare_py2pt_jobs(
 
 def _run_py2pt_phase(args: argparse.Namespace, manifest_rows: list[dict[str, str]]) -> list[Py2PTResult]:
     phase_root = args.output_dir / "uma_torchsim_screen" / args.system_type
-    jobs, skipped = _prepare_py2pt_jobs(phase_root, manifest_rows, args.timestep_ps)
+    jobs, skipped = _prepare_py2pt_jobs(phase_root, manifest_rows, args.timestep_ps, args.system_type)
 
     results: list[Py2PTResult] = []
     if jobs:
