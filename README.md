@@ -539,14 +539,11 @@ hrw-electrode-generate --help
 
 `maml` is required for DIRECT sampling in both electrode and electrolyte pipelines and is installed automatically by `pip install -e .`.
 
-Recommended clean install path for UMA + MatGL:
+Recommended clean install path for UMA:
 
 ```bash
-python -m pip install "fairchem-core==2.15.0" matgl maml
-# Install a DGL wheel matching your active torch/CUDA stack for CHGNet/QET models.
+python -m pip install "fairchem-core==2.15.0" maml
 # For fairchem-core 2.15.0, torch~=2.8.0 is expected.
-# Follow MatGL + DGL install docs to pick the correct wheel URL for your platform.
-python -m pip install "dgl>=2.2.0,<2.5"
 python -m pip install -e .
 ```
 
@@ -554,23 +551,15 @@ Expected UMA package line after install: `fairchem-core 2.15.0`.
 
 Dependency compatibility note:
 
-- This project now aligns with `fairchem-core==2.15.0` and MatGL (`numpy>=2.0,<2.4`, `torch~=2.8.0`).
+- This project now aligns with `fairchem-core==2.15.0` (`numpy>=2.0,<2.4`, `torch~=2.8.0`).
 - Packages that still require `numpy<2` (for example, some older diffusion-analysis packages) must be installed in a separate environment.
 
 For MPID-based structure loading, set `MP_API_KEY` in your environment.
 
-MatGL/UMA model note:
+UMA model note:
 
-MatGL and UMA recommended defaults:
-
-- Electrode generation: MatGL `CHGNet-MatPES-PBE-2025.2.10-2.7M-PES` and UMA task `omat`.
-- Electrolyte generation: MatGL `QET-MatQ-PES` and UMA task `omol`.
-
-MatGL installation note (important for CHGNet/QET):
-
-- CHGNet and QET are DGL-backed in MatGL, so install DGL in your environment and use `--matgl-backend dgl`.
-- MatGL v2 defaults to PyG; DGL-backed models require backend selection via `MATGL_BACKEND=DGL` or `matgl.set_backend("DGL")` (the pipeline sets this automatically from `--matgl-backend`).
-- Follow MatGL's installation guidance to choose a DGL wheel that matches your Torch/CUDA stack.
+- Electrode generation UMA task default: `omat`.
+- Electrolyte generation UMA task default: `omol`.
 
 Run only the implemented next stage (pristine loading + delithiation generation):
 
