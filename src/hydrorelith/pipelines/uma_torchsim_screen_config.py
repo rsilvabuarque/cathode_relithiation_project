@@ -18,9 +18,13 @@ class ScreenConfig:
     ensemble: str
     timestep_ps: float
     dump_every_steps: int
+    minimize_steps: int
+    heat_steps: int
+    heat_start_temperature_k: float
     retherm_steps_electrode: int
     retherm_steps_electrolyte: int
     prod_steps: int
+    production_stages: int
     replicas: int
     base_seed: int
     compute_stress: bool
@@ -64,9 +68,13 @@ def default_config() -> ScreenConfig:
         ensemble="nvt",
         timestep_ps=0.001,
         dump_every_steps=2,
+        minimize_steps=2000,
+        heat_steps=10000,
+        heat_start_temperature_k=1.0,
         retherm_steps_electrode=2000,
         retherm_steps_electrolyte=8000,
         prod_steps=25000,
+        production_stages=15,
         replicas=3,
         base_seed=0,
         compute_stress=False,
@@ -122,9 +130,13 @@ def parse_args_to_config(args) -> ScreenConfig:
     cfg.ensemble = args.ensemble
     cfg.timestep_ps = args.timestep_ps
     cfg.dump_every_steps = args.dump_every_steps
+    cfg.minimize_steps = args.minimize_steps
+    cfg.heat_steps = args.heat_steps
+    cfg.heat_start_temperature_k = args.heat_start_temperature_k
     cfg.retherm_steps_electrode = args.retherm_steps_electrode
     cfg.retherm_steps_electrolyte = args.retherm_steps_electrolyte
     cfg.prod_steps = args.prod_steps
+    cfg.production_stages = args.production_stages
     cfg.replicas = args.replicas
     cfg.base_seed = args.base_seed
     cfg.compute_stress = args.compute_stress
@@ -165,6 +177,14 @@ def parse_args_to_config(args) -> ScreenConfig:
         raise ValueError("--dump-every-steps must be > 0")
     if cfg.timestep_ps <= 0:
         raise ValueError("--timestep-ps must be > 0")
+    if cfg.minimize_steps < 0:
+        raise ValueError("--minimize-steps must be >= 0")
+    if cfg.heat_steps < 0:
+        raise ValueError("--heat-steps must be >= 0")
+    if cfg.heat_start_temperature_k <= 0:
+        raise ValueError("--heat-start-temperature-k must be > 0")
+    if cfg.production_stages <= 0:
+        raise ValueError("--production-stages must be > 0")
     if cfg.benchmark_steps <= 0:
         raise ValueError("--benchmark-steps must be > 0")
     if cfg.benchmark_warmup_steps < 0:

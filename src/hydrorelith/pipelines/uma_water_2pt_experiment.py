@@ -10,6 +10,7 @@ from hydrorelith.io.torchsim_export2pt import (
     ATM_PER_MPA,
     export_h5md_to_lammps_dump,
     write_2pt_metadata,
+    write_lammps_data_full_from_structure,
     write_lammps_eng_from_thermo_csv,
 )
 from hydrorelith.pipelines.uma_torchsim_screen_config import default_config
@@ -80,6 +81,7 @@ def _export_lammps_artifacts(
     output_dir: Path,
     *,
     sname: str,
+    structure_path: Path,
     timestep_ps: float,
     dump_every_steps: int,
 ) -> list[Path]:
@@ -101,6 +103,7 @@ def _export_lammps_artifacts(
 
             traj_generic = out_dir / "prod.lammpstrj"
             eng_generic = out_dir / "prod.eng"
+            data_generic = out_dir / "prod.data"
             export_h5md_to_lammps_dump(
                 prod_h5,
                 traj_generic,
@@ -109,6 +112,7 @@ def _export_lammps_artifacts(
                 lammps_template_style=True,
             )
             write_lammps_eng_from_thermo_csv(prod_thermo, eng_generic)
+            write_lammps_data_full_from_structure(structure_path, data_generic)
             write_2pt_metadata(
                 prod_thermo,
                 out_dir / "2pt_metadata.json",
@@ -121,6 +125,7 @@ def _export_lammps_artifacts(
             shutil.copy2(traj_generic, out_dir / f"{sname}_prod.lammpstrj")
             shutil.copy2(traj_generic, out_dir / f"{sname}_prod.lammps")
             shutil.copy2(eng_generic, out_dir / f"{sname}_prod.eng")
+            shutil.copy2(data_generic, out_dir / f"{sname}_prod.data")
 
             exported_dirs.append(out_dir)
 
@@ -221,6 +226,7 @@ def main() -> None:
     exported_dirs = _export_lammps_artifacts(
         output_dir,
         sname=args.sname,
+        structure_path=cif_path,
         timestep_ps=timestep_ps,
         dump_every_steps=int(args.dump_every_steps),
     )

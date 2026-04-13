@@ -138,6 +138,8 @@ def export_h5md_to_lammps_dump(
 
     out_lammpstrj.parent.mkdir(parents=True, exist_ok=True)
     written_cols: list[str] = []
+    atom_ids = np.arange(1, natoms + 1, dtype=int)
+    sort_order = np.argsort(atom_ids, kind="stable")
     with out_lammpstrj.open("w", encoding="utf-8") as handle:
         for frame in range(positions.shape[0]):
             cell = cells[frame]
@@ -167,45 +169,46 @@ def export_h5md_to_lammps_dump(
 
             ke_atom = 0.5 * masses * np.sum(velocities[frame] ** 2, axis=1) / AMU_TO_EV_PS2_PER_A2
             atom_eng = (ke_atom + atom_pe[frame]) if atom_eng_available else None
-            for i in range(len(z)):
-                q_val = charge_frame[frame, i] if charge_frame is not None else charge_static[i]
-                v_atomeng = float(atom_eng[i]) if atom_eng_available else float(ke_atom[i])
+            for idx in sort_order:
+                atom_id = int(atom_ids[idx])
+                q_val = charge_frame[frame, idx] if charge_frame is not None else charge_static[idx]
+                v_atomeng = float(atom_eng[idx]) if atom_eng_available else float(ke_atom[idx])
                 if lammps_template_style:
                     vals = [
-                        str(i + 1),
-                        str(int(mol_ids[i])),
-                        str(type_ids[i]),
+                        str(atom_id),
+                        str(int(mol_ids[idx])),
+                        str(type_ids[idx]),
                         f"{float(q_val):.10f}",
-                        f"{positions[frame, i, 0]:.10f}",
-                        f"{positions[frame, i, 1]:.10f}",
-                        f"{positions[frame, i, 2]:.10f}",
-                        f"{velocities[frame, i, 0]:.10f}",
-                        f"{velocities[frame, i, 1]:.10f}",
-                        f"{velocities[frame, i, 2]:.10f}",
+                        f"{positions[frame, idx, 0]:.10f}",
+                        f"{positions[frame, idx, 1]:.10f}",
+                        f"{positions[frame, idx, 2]:.10f}",
+                        f"{velocities[frame, idx, 0]:.10f}",
+                        f"{velocities[frame, idx, 1]:.10f}",
+                        f"{velocities[frame, idx, 2]:.10f}",
                         f"{v_atomeng:.10f}",
                     ]
                 else:
                     vals = [
-                        str(i + 1),
-                        str(type_ids[i]),
-                        f"{positions[frame, i, 0]:.10f}",
-                        f"{positions[frame, i, 1]:.10f}",
-                        f"{positions[frame, i, 2]:.10f}",
-                        f"{velocities[frame, i, 0]:.10f}",
-                        f"{velocities[frame, i, 1]:.10f}",
-                        f"{velocities[frame, i, 2]:.10f}",
+                        str(atom_id),
+                        str(type_ids[idx]),
+                        f"{positions[frame, idx, 0]:.10f}",
+                        f"{positions[frame, idx, 1]:.10f}",
+                        f"{positions[frame, idx, 2]:.10f}",
+                        f"{velocities[frame, idx, 0]:.10f}",
+                        f"{velocities[frame, idx, 1]:.10f}",
+                        f"{velocities[frame, idx, 2]:.10f}",
                     ]
                     if include_ke_atom:
-                        vals.append(f"{ke_atom[i]:.10f}")
+                        vals.append(f"{ke_atom[idx]:.10f}")
                     if pe_atom_available:
-                        vals.append(f"{float(atom_pe[frame, i]):.10f}")
-                        vals.append(f"{float(atom_eng[i]):.10f}")
+                        vals.append(f"{float(atom_pe[frame, idx]):.10f}")
+                        vals.append(f"{float(atom_eng[idx]):.10f}")
                     if forces_available:
                         vals.extend(
                             [
-                                f"{float(forces[frame, i, 0]):.10f}",
-                                f"{float(forces[frame, i, 1]):.10f}",
-                                f"{float(forces[frame, i, 2]):.10f}",
+                                f"{float(forces[frame, idx, 0]):.10f}",
+                                f"{float(forces[frame, idx, 1]):.10f}",
+                                f"{float(forces[frame, idx, 2]):.10f}",
                             ]
                         )
                 handle.write(" ".join(vals) + "\n")
@@ -307,10 +310,8 @@ def write_lammps_eng_from_thermo_csv(
 
     out_eng.parent.mkdir(parents=True, exist_ok=True)
     with out_eng.open("w", encoding="utf-8") as handle:
-        handle.write("# LAMMPS-like thermo log synthesized from TorchSim outputs\n")
-        handle.write("# thermo 4\n")
-        handle.write("# thermo_style custom etotal ke temp pe ebond eangle edihed eimp evdwl ecoul elong ebond press vol\n")
-        handle.write("# thermo_modify line multi\n")
+        handle.write("thermo_style   custom etotal ke temp pe ebond eangle edihed eimp evdwl ecoul elong ebond press vol\n")
+        handle.write("thermo_modify  line multi\n")
         for step, time_fs, temp_k, press_atm, volume_a3, etotal_ev, pe_ev, ke_ev in rows:
             handle.write(f"----------------------------- Step {step:d} -----------------------------\n")
             handle.write(
@@ -320,6 +321,71 @@ def write_lammps_eng_from_thermo_csv(
             handle.write("E_bond = 0.0000000000 E_angle = 0.0000000000 E_dihed = 0.0000000000 E_impro = 0.0000000000\n")
             handle.write("E_vdwl = 0.0000000000 E_coul = 0.0000000000 E_long = 0.0000000000\n")
             handle.write(f"Press = {press_atm:.10f} Volume = {volume_a3:.10f} Time_fs = {time_fs:.6f}\n")
+
+
+def write_lammps_data_full_from_structure(
+    structure_path: Path,
+    out_data: Path,
+    *,
+    default_molecule_id: int = 1,
+) -> None:
+    from ase.io import read as ase_read
+    from ase.io import write as ase_write
+
+    atoms = ase_read(structure_path)
+    if len(atoms) <= 0:
+        raise ValueError(f"Structure has no atoms: {structure_path}")
+
+    atoms = atoms.copy()
+    natoms = len(atoms)
+
+    # Ensure finite per-atom charges exist for atom_style full.
+    try:
+        charges = np.asarray(atoms.get_initial_charges(), dtype=float)
+    except Exception:
+        charges = np.zeros((natoms,), dtype=float)
+    if charges.shape != (natoms,):
+        charges = np.zeros((natoms,), dtype=float)
+    charges = np.where(np.isfinite(charges), charges, 0.0)
+    atoms.set_initial_charges(charges)
+
+    # ASE uses the "mol-id" array label for molecule IDs in full-style output.
+    if atoms.has("mol-id"):
+        mol_ids = np.asarray(atoms.get_array("mol-id"))
+        if mol_ids.shape != (natoms,):
+            mol_ids = np.full((natoms,), int(default_molecule_id), dtype=np.int32)
+        else:
+            mol_ids = np.asarray(np.rint(mol_ids), dtype=np.int32)
+    else:
+        mol_ids = np.full((natoms,), int(default_molecule_id), dtype=np.int32)
+    mol_ids = np.where(mol_ids > 0, mol_ids, int(default_molecule_id)).astype(np.int32, copy=False)
+    if atoms.has("mol-id"):
+        atoms.set_array("mol-id", mol_ids)
+    else:
+        atoms.new_array("mol-id", mol_ids)
+
+    # Ensure a non-degenerate simulation box for LAMMPS data export.
+    cell = np.asarray(atoms.cell.array, dtype=float)
+    if abs(float(np.linalg.det(cell))) <= 1e-12:
+        pos = np.asarray(atoms.get_positions(), dtype=float)
+        mins = np.min(pos, axis=0)
+        maxs = np.max(pos, axis=0)
+        lengths = np.maximum(maxs - mins + 20.0, 20.0)
+        atoms.set_positions(pos - mins + 10.0)
+        atoms.set_cell(np.diag(lengths), scale_atoms=False)
+        atoms.set_pbc([True, True, True])
+
+    out_data.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(
+        out_data,
+        atoms,
+        format="lammps-data",
+        atom_style="full",
+        masses=True,
+        velocities=False,
+        units="metal",
+        bonds=True,
+    )
 
 
 def main_export2pt_cli() -> None:

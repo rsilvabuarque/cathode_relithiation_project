@@ -33,7 +33,7 @@ two-pt = [
 uma-forks = [
   "fairchem-core @ git+https://github.com/rsilvabuarque/fairchem.git@feature/uma-per-atom-energy-inference#subdirectory=packages/fairchem-core",
   "torch-sim-atomistic[fairchem] @ git+https://github.com/rsilvabuarque/torch-sim.git@feature/per-atom-energy-reporting",
-  "py2pt @ git+https://github.com/rsilvabuarque/py2pt.git@main",
+  "py2pt @ git+https://github.com/rsilvabuarque/py2pt.git@fix/torchsim-flat-h5md-compat",
 ]
 dev = [
   "pytest",

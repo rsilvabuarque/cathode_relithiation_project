@@ -95,4 +95,4 @@ This installs:
 
 - `fairchem-core` from `feature/uma-per-atom-energy-inference`
 - `torch-sim-atomistic` from `feature/per-atom-energy-reporting`
-- `py2pt` from `rsilvabuarque/py2pt`
+- `py2pt` from `fix/torchsim-flat-h5md-compat` in `rsilvabuarque/py2pt`

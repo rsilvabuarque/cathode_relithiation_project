@@ -37,6 +37,10 @@ def test_water_2pt_experiment_exports_expected_files(tmp_path: Path, monkeypatch
         assert thermo_csv.exists()
         out_eng.write_text("# fake eng\n", encoding="utf-8")
 
+    def _fake_write_lammps_data_full_from_structure(structure_path: Path, out_data: Path) -> None:
+        assert structure_path.exists()
+        out_data.write_text("(written by ASE)\n\n1 atoms\n", encoding="utf-8")
+
     def _fake_write_2pt_metadata(prod_thermo_csv: Path, out_json: Path, *, timestep_ps: float, dump_every_steps: int) -> None:
         assert prod_thermo_csv.exists()
         out_json.write_text(
@@ -53,6 +57,7 @@ def test_water_2pt_experiment_exports_expected_files(tmp_path: Path, monkeypatch
     monkeypatch.setattr(water_mod, "run_one_phase", _fake_run_one_phase)
     monkeypatch.setattr(water_mod, "export_h5md_to_lammps_dump", _fake_export_h5md_to_lammps_dump)
     monkeypatch.setattr(water_mod, "write_lammps_eng_from_thermo_csv", _fake_write_lammps_eng_from_thermo_csv)
+    monkeypatch.setattr(water_mod, "write_lammps_data_full_from_structure", _fake_write_lammps_data_full_from_structure)
     monkeypatch.setattr(water_mod, "write_2pt_metadata", _fake_write_2pt_metadata)
 
     out_dir = tmp_path / "out"
@@ -81,9 +86,11 @@ def test_water_2pt_experiment_exports_expected_files(tmp_path: Path, monkeypatch
     assert (export_dir / "prod.lammpstrj").exists()
     assert (export_dir / "prod.lammps").exists()
     assert (export_dir / "prod.eng").exists()
+    assert (export_dir / "prod.data").exists()
     assert (export_dir / "electrolyte_prod.lammpstrj").exists()
     assert (export_dir / "electrolyte_prod.lammps").exists()
     assert (export_dir / "electrolyte_prod.eng").exists()
+    assert (export_dir / "electrolyte_prod.data").exists()
     assert (export_dir / "type_map.json").exists()
     assert (export_dir / "2pt_metadata.json").exists()
 

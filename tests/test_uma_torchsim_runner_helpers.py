@@ -58,6 +58,23 @@ def test_resume_plan_requires_all_or_none_existing_files(tmp_path: Path) -> None
         run_mod._determine_resume_plan(SimpleNamespace(), files, n_steps_target=10, device="cpu", dtype="float32")
 
 
+def test_resume_plan_with_existing_files_and_no_steps_starts_fresh(tmp_path: Path, monkeypatch) -> None:
+    files = [tmp_path / "a.h5", tmp_path / "b.h5"]
+    for path in files:
+        path.touch()
+
+    monkeypatch.setattr(run_mod, "_h5_last_step", lambda _ts, _p: None)
+
+    plan = run_mod._determine_resume_plan(SimpleNamespace(), files, n_steps_target=10, device="cpu", dtype="float32")
+
+    assert plan["resume_mode"] is False
+    assert plan["reporter_mode"] == "w"
+    assert plan["resume_from_step"] == 0
+    assert plan["steps_remaining"] == 10
+    assert plan["completed"] is False
+    assert plan["state"] is None
+
+
 def test_benchmark_batch_scaling_writes_sorted_csv(tmp_path: Path, monkeypatch) -> None:
     class FakeIntegrator:
         nvt_langevin = "nvt_langevin"

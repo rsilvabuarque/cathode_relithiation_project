@@ -9,6 +9,7 @@ import pytest
 from hydrorelith.io.torchsim_export2pt import (
     AMU_TO_EV_PS2_PER_A2,
     export_h5md_to_lammps_dump,
+    write_lammps_data_full_from_structure,
     write_lammps_eng_from_thermo_csv,
 )
 
@@ -139,14 +140,36 @@ def test_write_lammps_eng_from_thermo_csv(tmp_path: Path) -> None:
     write_lammps_eng_from_thermo_csv(thermo, out_eng)
 
     lines = out_eng.read_text(encoding="utf-8").splitlines()
-    assert lines[0].startswith("# LAMMPS-like thermo log")
-    assert lines[1] == "# thermo 4"
-    assert lines[2].startswith("# thermo_style custom etotal ke temp pe")
-    assert lines[3] == "# thermo_modify line multi"
-    assert "Step 0" in lines[4]
-    assert "TotEng = -8.5000000000" in lines[5]
-    assert "KinEng = 1.5000000000" in lines[5]
-    assert "Temp = 298.0000000000" in lines[5]
-    assert "PotEng = -10.0000000000" in lines[5]
-    assert "Press = 9.8692326672" in lines[8]
-    assert "Volume = 1000.0000000000" in lines[8]
+    assert lines[0] == "thermo_style   custom etotal ke temp pe ebond eangle edihed eimp evdwl ecoul elong ebond press vol"
+    assert lines[1] == "thermo_modify  line multi"
+    assert "Step 0" in lines[2]
+    assert "TotEng = -8.5000000000" in lines[3]
+    assert "KinEng = 1.5000000000" in lines[3]
+    assert "Temp = 298.0000000000" in lines[3]
+    assert "PotEng = -10.0000000000" in lines[3]
+    assert "Press = 9.8692326672" in lines[6]
+    assert "Volume = 1000.0000000000" in lines[6]
+
+
+def test_write_lammps_data_full_from_structure(tmp_path: Path) -> None:
+    ase = pytest.importorskip("ase")
+    ase_io = pytest.importorskip("ase.io")
+    Atoms = ase.Atoms
+    ase_write = ase_io.write
+
+    structure = Atoms(
+        "H2O",
+        positions=[[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [0.0, 0.96, 0.0]],
+        cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]],
+        pbc=True,
+    )
+    cif_path = tmp_path / "water.cif"
+    ase_write(cif_path, structure, format="cif")
+
+    out_data = tmp_path / "prod.data"
+    write_lammps_data_full_from_structure(cif_path, out_data)
+
+    text = out_data.read_text(encoding="utf-8")
+    assert "Atoms # full" in text
+    assert "3 atoms" in text
+    assert "Masses" in text

@@ -216,6 +216,17 @@ def _load_items_for_phase(config: ScreenConfig, phase: str) -> list[StructureIte
     return items
 
 
+def _read_atoms_any(path: Path | str) -> Atoms:
+    p = Path(path)
+    name_upper = p.name.upper()
+    ext = p.suffix.lower()
+    if name_upper.startswith("POSCAR") or ext == ".vasp":
+        return ase_read(p, format="vasp")
+    if ext in {".data", ".lammps", ".lmp"} or name_upper.startswith("DATA."):
+        return ase_read(p, format="lammps-data")
+    return ase_read(p)
+
+
 def _write_h5md_flat(
     out_path: Path,
     atomic_numbers: np.ndarray,
@@ -599,7 +610,12 @@ def _load_resume_state(ts, path: Path, device, dtype):
             momenta = velocities * state.masses.unsqueeze(-1)
             forces = torch.tensor(traj.get_array("forces", start=frame, stop=frame + 1)[0], device=device, dtype=dtype) if "forces" in traj.array_registry else torch.zeros_like(state.positions)
             energy = torch.zeros((state.n_systems,), device=device, dtype=dtype)
-            return ts.MDState.from_state(state, momenta=momenta, energy=energy, forces=forces)
+            state_cls = getattr(ts, "MDState", None)
+            if state_cls is None:
+                state_cls = getattr(ts, "SimState", None)
+            if state_cls is not None and hasattr(state_cls, "from_state"):
+                return state_cls.from_state(state, momenta=momenta, energy=energy, forces=forces)
+            return state
         return state
 
 
@@ -627,8 +643,8 @@ def _determine_resume_plan(ts, files: list[Path], n_steps_target: int, device, d
     steps = [_h5_last_step(ts, p) for p in files]
     nonnull = [int(s) for s in steps if s is not None]
     if not nonnull:
-        plan["resume_mode"] = True
-        plan["reporter_mode"] = "a"
+        # Existing files but no recorded steps: treat as a fresh run.
+        # Keep reporter in write mode so stale/partial files are replaced.
         return plan
 
     common_last = min(nonnull)
@@ -743,10 +759,29 @@ def _benchmark_batch_scaling(ts, atoms_list: list[Atoms], model, config: ScreenC
         _save_benchmark_rows(rows, bench_dir)
 
 
-def _tp_group_key(item: StructureItem, run_name: str) -> tuple[float, float | None, str]:
+def _is_prod_segment_name(run_name: str) -> bool:
+    return run_name.startswith("prod_2pt_")
+
+
+def _stage_group_key(item: StructureItem, run_name: str) -> tuple[float, float | None, str]:
     temp_k = float(item.temperature_C) + 273.15
+    if run_name == "minimize":
+        # Minimization is temperature-independent; grouping by task maximizes batching.
+        return (1.0, None, item.task_name)
+    if run_name in {"heat", "retherm"} or _is_prod_segment_name(run_name) or run_name == "prod":
+        pressure = float(item.pressure_MPa) if run_name == "retherm" else None
+        return (temp_k, pressure, item.task_name)
     pressure = float(item.pressure_MPa) if run_name == "retherm" else None
     return (temp_k, pressure, item.task_name)
+
+
+def _split_steps_for_segments(total_steps: int, n_segments: int) -> list[int]:
+    if total_steps <= 0 or n_segments <= 0:
+        return []
+    base = total_steps // n_segments
+    rem = total_steps % n_segments
+    out = [base + (1 if idx < rem else 0) for idx in range(n_segments)]
+    return [v for v in out if v > 0]
 
 
 def _trajectory_paths(rep_dir: Path, run_name: str) -> tuple[Path, Path, Path]:
@@ -814,6 +849,203 @@ def _integrate_with_step_eta(
     return elapsed_total
 
 
+def _integrate_with_temperature_ramp_eta(
+    ts,
+    integrate_kwargs: dict[str, Any],
+    total_steps: int,
+    *,
+    temperature_start_k: float,
+    temperature_end_k: float,
+    bar_desc: str,
+    group_size: int,
+    global_bar,
+    global_tracker: _EmaRateTracker,
+) -> float:
+    if total_steps <= 0:
+        return 0.0
+
+    chunk_steps = max(1, min(1000, int(total_steps)))
+    local_tracker = _EmaRateTracker(alpha=0.30)
+    state = integrate_kwargs["system"]
+    base_kwargs = {k: v for k, v in integrate_kwargs.items() if k not in {"system", "n_steps", "temperature"}}
+
+    done = 0
+    elapsed_total = 0.0
+    step_bar = tqdm(total=int(total_steps), desc=bar_desc, unit="step", leave=False)
+    try:
+        while done < int(total_steps):
+            n_chunk = min(chunk_steps, int(total_steps) - done)
+            frac = float(done + n_chunk) / float(total_steps)
+            target_temp = float(temperature_start_k) + (float(temperature_end_k) - float(temperature_start_k)) * frac
+
+            call_kwargs = dict(base_kwargs)
+            call_kwargs["system"] = state
+            call_kwargs["n_steps"] = int(n_chunk)
+            call_kwargs["temperature"] = float(target_temp)
+
+            t0 = time.perf_counter()
+            state = ts.integrate(**call_kwargs)
+            elapsed = time.perf_counter() - t0
+            elapsed_total += elapsed
+            done += int(n_chunk)
+
+            local_tracker.update(int(n_chunk), elapsed)
+            global_tracker.update(int(n_chunk) * int(group_size), elapsed)
+            step_bar.update(int(n_chunk))
+            global_bar.update(int(n_chunk) * int(group_size))
+
+            eta_local = local_tracker.eta(int(total_steps) - done)
+            eta_global = global_tracker.eta(max(0, int(global_bar.total) - int(global_bar.n)))
+            postfix_bits = [f"T={target_temp:.1f}K"]
+            if local_tracker.steps_per_sec is not None:
+                postfix_bits.append(f"rate={local_tracker.steps_per_sec:.1f} step/s")
+            if eta_local is not None:
+                postfix_bits.append(f"eta={_format_duration(eta_local)}")
+            if eta_global is not None:
+                postfix_bits.append(f"eta_total={_format_duration(eta_global)}")
+            step_bar.set_postfix_str(" | ".join(postfix_bits))
+    finally:
+        step_bar.close()
+    return elapsed_total
+
+
+def _optimize_with_step_eta(
+    ts,
+    optimize_kwargs: dict[str, Any],
+    total_steps: int,
+    *,
+    bar_desc: str,
+    group_size: int,
+    global_bar,
+    global_tracker: _EmaRateTracker,
+) -> float:
+    if total_steps <= 0:
+        return 0.0
+
+    tqdm.write(f"[md] {bar_desc}: running FIRE minimization up to {int(total_steps)} steps")
+    t0 = time.perf_counter()
+    _ = ts.optimize(**optimize_kwargs)
+    elapsed = time.perf_counter() - t0
+    global_bar.update(int(total_steps) * int(group_size))
+    global_tracker.update(int(total_steps) * int(group_size), max(elapsed, 1.0e-12))
+    return elapsed
+
+
+def _concat_h5md_segments(segment_paths: list[Path], out_path: Path) -> None:
+    if not segment_paths:
+        return
+    import h5py
+
+    frame_keys = {
+        "positions",
+        "velocities",
+        "forces",
+        "cell",
+        "step",
+        "time_ps",
+        "potential_energy",
+        "kinetic_energy",
+        "temperature",
+        "volume",
+        "atom_potential_energy",
+    }
+
+    static_data: dict[str, np.ndarray] = {}
+    frame_data: dict[str, list[np.ndarray]] = {}
+    for seg_path in segment_paths:
+        if not seg_path.exists():
+            continue
+        with h5py.File(seg_path, "r") as h5:
+            for key in h5.keys():
+                arr = np.asarray(h5[key])
+                if key in frame_keys and arr.ndim >= 1:
+                    frame_data.setdefault(key, []).append(arr)
+                elif key not in static_data:
+                    static_data[key] = arr
+
+    if not frame_data:
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(out_path, "w") as h5:
+        for key, arr in static_data.items():
+            h5.create_dataset(key, data=arr)
+        for key, pieces in frame_data.items():
+            if not pieces:
+                continue
+            merged = np.concatenate(pieces, axis=0)
+            h5.create_dataset(key, data=merged)
+
+
+def _concat_thermo_segments(segment_paths: list[Path], out_path: Path) -> None:
+    if not segment_paths:
+        return
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] | None = None
+    for seg_path in segment_paths:
+        if not seg_path.exists():
+            continue
+        with seg_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if fieldnames is None:
+                fieldnames = list(reader.fieldnames or [])
+            rows.extend(reader)
+    if fieldnames is None:
+        return
+
+    def _step_key(row: dict[str, str]) -> int:
+        try:
+            return int(float(row.get("step", "0")))
+        except ValueError:
+            return 0
+
+    rows.sort(key=_step_key)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _finalize_production_segments(rep_dir: Path, prod_stage_names: list[str]) -> None:
+    if not prod_stage_names:
+        return
+    h5_segments = [rep_dir / f"{name}.h5md" for name in prod_stage_names]
+    thermo_segments = [rep_dir / f"{name}_thermo.csv" for name in prod_stage_names]
+    _concat_h5md_segments(h5_segments, rep_dir / "prod.h5md")
+    _concat_thermo_segments(thermo_segments, rep_dir / "prod_thermo.csv")
+
+
+def _state_to_atoms_list(state, atoms_list: list[Atoms]) -> list[Atoms]:
+    def _to_numpy(x: Any) -> np.ndarray:
+        if hasattr(x, "detach"):
+            return np.asarray(x.detach().cpu().numpy())
+        return np.asarray(x)
+
+    positions = _to_numpy(state.positions).astype(float, copy=False)
+    system_idx = _to_numpy(state.system_idx).astype(int, copy=False)
+    cell = _to_numpy(state.cell).astype(float, copy=False)
+
+    out: list[Atoms] = []
+    cursor = 0
+    for sys_i, atoms in enumerate(atoms_list):
+        nat = int(len(atoms))
+        sel = np.where(system_idx == int(sys_i))[0]
+        if int(sel.size) == nat:
+            pos_sys = positions[sel]
+        else:
+            # Fall back to contiguous slicing if system indices were reordered.
+            pos_sys = positions[cursor : cursor + nat]
+        cursor += nat
+
+        atoms_next = atoms.copy()
+        atoms_next.set_positions(np.asarray(pos_sys, dtype=float))
+        if cell.ndim == 3 and sys_i < cell.shape[0]:
+            atoms_next.set_cell(np.asarray(cell[sys_i], dtype=float), scale_atoms=False)
+        out.append(atoms_next)
+    return out
+
+
 def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str) -> None:
     import torch
     import torch_sim as ts
@@ -828,12 +1060,30 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
     model = load_fairchem_model(config.model_name, "omol" if phase == "electrolyte" else "omat", device_name, True)
     initial_atoms = []
     for item in items:
-        atoms = ase_read(item.structure_path)
+        atoms = _read_atoms_any(item.structure_path)
         atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
         initial_atoms.append(atoms)
 
     initial_states = [ts.initialize_state(at, device=device, dtype=dtype) for at in initial_atoms]
     memory_scalers, resolved_max_memory_scaler, scaler_source = _resolve_memory_scalers(ts, initial_states, model, config)
+    retherm_steps = int(config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode)
+    production_segment_steps = _split_steps_for_segments(int(config.prod_steps), int(config.production_stages))
+    production_stage_names = [f"prod_2pt_{idx + 1:02d}" for idx in range(len(production_segment_steps))]
+
+    stage_plan: list[tuple[str, int]] = []
+    if int(config.minimize_steps) > 0:
+        stage_plan.append(("minimize", int(config.minimize_steps)))
+    if int(config.heat_steps) > 0:
+        stage_plan.append(("heat", int(config.heat_steps)))
+    if retherm_steps > 0:
+        stage_plan.append(("retherm", retherm_steps))
+    for name, steps in zip(production_stage_names, production_segment_steps, strict=True):
+        if int(steps) > 0:
+            stage_plan.append((name, int(steps)))
+
+    if not stage_plan:
+        raise ValueError("No MD stages configured. Increase --minimize-steps/--heat-steps/--retherm-steps/--prod-steps.")
+
     run_config_path = out_root / "run_config.json"
     _write_json_atomic(
         run_config_path,
@@ -845,8 +1095,14 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
             "resolved_max_memory_scaler": resolved_max_memory_scaler,
             "max_memory_scaler_source": scaler_source,
             "replicas": config.replicas,
-            "retherm_steps": config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode,
+            "minimize_steps": int(config.minimize_steps),
+            "heat_steps": int(config.heat_steps),
+            "heat_start_temperature_k": float(config.heat_start_temperature_k),
+            "retherm_steps": retherm_steps,
             "prod_steps": config.prod_steps,
+            "production_stages": int(config.production_stages),
+            "production_stage_names": production_stage_names,
+            "stage_plan": [{"name": name, "steps": int(steps)} for name, steps in stage_plan],
             "dump_every_steps": config.dump_every_steps,
             "timestep_ps": config.timestep_ps,
             "benchmark_skipped": config.skip_batch_benchmark,
@@ -868,27 +1124,32 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
             scaler_source=scaler_source,
         )
 
-    retherm_steps = config.retherm_steps_electrolyte if phase == "electrolyte" else config.retherm_steps_electrode
-    total_system_steps = int(config.replicas) * int(len(items)) * int(retherm_steps + config.prod_steps)
+    total_steps_per_system = int(sum(int(steps) for _, steps in stage_plan))
+    total_system_steps = int(config.replicas) * int(len(items)) * int(total_steps_per_system)
     global_tracker = _EmaRateTracker(alpha=0.30)
     global_bar = tqdm(total=total_system_steps, desc=f"{phase} MD system-steps", unit="sys-step")
 
     for replica in range(config.replicas):
         start_atoms_by_condition: dict[str, Atoms] = {}
         for item_idx, item in enumerate(items):
-            atoms = ase_read(item.structure_path)
+            atoms = _read_atoms_any(item.structure_path)
             atoms = prepare_atoms_for_task(atoms, item.task_name, item.charge, item.spin)
             start_atoms_by_condition[item.condition_id] = atoms
 
-        for run_name, nsteps in (("retherm", retherm_steps), ("prod", config.prod_steps)):
+        for run_name, nsteps in stage_plan:
             grouped: dict[tuple[float, float | None, str], list[tuple[int, StructureItem]]] = {}
             for item_idx, item in enumerate(items):
-                key = _tp_group_key(item, run_name)
+                key = _stage_group_key(item, run_name)
                 grouped.setdefault(key, []).append((item_idx, item))
 
             for group_key, cohort in grouped.items():
                 temp_k, pressure_mpa, task_name = group_key
-                phase_task_model = load_fairchem_model(config.model_name, task_name, device_name, True)
+                phase_task_model = load_fairchem_model(
+                    config.model_name,
+                    task_name,
+                    device_name,
+                    run_name != "minimize",
+                )
 
                 atoms_list: list[Atoms] = []
                 ts_files: list[Path] = []
@@ -919,7 +1180,7 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                 )
 
                 if not resume["completed"]:
-                    if resume["resume_mode"]:
+                    if resume["resume_mode"] and resume["state"] is not None:
                         batch_state = resume["state"]
                     else:
                         states = []
@@ -930,83 +1191,150 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         batch_state = ts.concatenate_states(states)
                         batch_state.rng = int(config.base_seed + replica)
 
+                    stage_dump_every = max(1, min(int(config.dump_every_steps), int(resume["steps_remaining"])))
+                    reporter_state_kwargs = {
+                        "save_velocities": run_name != "minimize",
+                        "save_forces": run_name != "minimize",
+                        "variable_cell": run_name == "retherm",
+                        "variable_masses": False,
+                        "variable_atomic_numbers": False,
+                    }
+                    reporter_props = {} if run_name == "minimize" else {stage_dump_every: _build_prop_calculators(ts)[1]}
                     rep = ts.TrajectoryReporter(
                         filenames=[str(p) for p in ts_files],
-                        state_frequency=config.dump_every_steps,
-                        prop_calculators={config.dump_every_steps: _build_prop_calculators(ts)[1]},
-                        state_kwargs={
-                            "save_velocities": True,
-                            "save_forces": True,
-                            "variable_cell": run_name == "retherm",
-                            "variable_masses": False,
-                            "variable_atomic_numbers": False,
-                        },
+                        state_frequency=stage_dump_every,
+                        prop_calculators=reporter_props,
+                        state_kwargs=reporter_state_kwargs,
                         trajectory_kwargs={"mode": resume["reporter_mode"]},
                     )
 
-                    kwargs: dict[str, Any] = {
-                        "system": batch_state,
-                        "model": phase_task_model,
-                        "integrator": _pick_integrator(ts, "npt" if run_name == "retherm" else "nvt"),
-                        "n_steps": int(resume["steps_remaining"]),
-                        "temperature": float(temp_k),
-                        "timestep": float(config.timestep_ps),
-                        "trajectory_reporter": rep,
-                        "autobatcher": _build_autobatcher(ts, phase_task_model, config, resolved_max_memory_scaler),
-                        "pbar": False,
-                    }
-                    if run_name == "retherm" and pressure_mpa is not None:
-                        kwargs["external_pressure"] = (float(pressure_mpa) / 101325.0) * EV_A3_PER_ATM
-
                     try:
-                        elapsed = _integrate_with_step_eta(
-                            ts,
-                            kwargs,
-                            int(resume["steps_remaining"]),
-                            bar_desc=(
-                                f"{phase} rep{replica:03d} {run_name} "
-                                f"T={temp_k:.1f}K batch={len(cohort)}"
-                            ),
-                            group_size=len(cohort),
-                            global_bar=global_bar,
-                            global_tracker=global_tracker,
-                        )
+                        if run_name == "minimize":
+                            # Use a short low-temperature NVT relaxation as the minimization stage.
+                            relax_kwargs: dict[str, Any] = {
+                                "system": batch_state,
+                                "model": phase_task_model,
+                                "integrator": _pick_integrator(ts, "nvt"),
+                                "n_steps": int(resume["steps_remaining"]),
+                                "temperature": float(config.heat_start_temperature_k),
+                                "timestep": float(config.timestep_ps),
+                                "trajectory_reporter": rep,
+                                "autobatcher": _build_autobatcher(ts, phase_task_model, config, resolved_max_memory_scaler),
+                                "pbar": False,
+                            }
+                            elapsed = _integrate_with_step_eta(
+                                ts,
+                                relax_kwargs,
+                                int(resume["steps_remaining"]),
+                                bar_desc=(
+                                    f"{phase} rep{replica:03d} minimize "
+                                    f"T={config.heat_start_temperature_k:.1f}K batch={len(cohort)}"
+                                ),
+                                group_size=len(cohort),
+                                global_bar=global_bar,
+                                global_tracker=global_tracker,
+                            )
+
+                        elif run_name == "heat":
+                            heat_kwargs: dict[str, Any] = {
+                                "system": batch_state,
+                                "model": phase_task_model,
+                                "integrator": _pick_integrator(ts, "nvt"),
+                                "n_steps": int(resume["steps_remaining"]),
+                                "temperature": float(config.heat_start_temperature_k),
+                                "timestep": float(config.timestep_ps),
+                                "trajectory_reporter": rep,
+                                "autobatcher": _build_autobatcher(ts, phase_task_model, config, resolved_max_memory_scaler),
+                                "pbar": False,
+                            }
+                            elapsed = _integrate_with_temperature_ramp_eta(
+                                ts,
+                                heat_kwargs,
+                                int(resume["steps_remaining"]),
+                                temperature_start_k=float(config.heat_start_temperature_k),
+                                temperature_end_k=float(temp_k),
+                                bar_desc=(
+                                    f"{phase} rep{replica:03d} heat "
+                                    f"{config.heat_start_temperature_k:.1f}->{temp_k:.1f}K batch={len(cohort)}"
+                                ),
+                                group_size=len(cohort),
+                                global_bar=global_bar,
+                                global_tracker=global_tracker,
+                            )
+
+                        else:
+                            kwargs: dict[str, Any] = {
+                                "system": batch_state,
+                                "model": phase_task_model,
+                                "integrator": _pick_integrator(ts, "npt" if run_name == "retherm" else "nvt"),
+                                "n_steps": int(resume["steps_remaining"]),
+                                "temperature": float(temp_k),
+                                "timestep": float(config.timestep_ps),
+                                "trajectory_reporter": rep,
+                                "autobatcher": _build_autobatcher(ts, phase_task_model, config, resolved_max_memory_scaler),
+                                "pbar": False,
+                            }
+                            if run_name == "retherm" and pressure_mpa is not None:
+                                kwargs["external_pressure"] = (float(pressure_mpa) / 101325.0) * EV_A3_PER_ATM
+
+                            elapsed = _integrate_with_step_eta(
+                                ts,
+                                kwargs,
+                                int(resume["steps_remaining"]),
+                                bar_desc=(
+                                    f"{phase} rep{replica:03d} {run_name} "
+                                    f"T={temp_k:.1f}K batch={len(cohort)}"
+                                ),
+                                group_size=len(cohort),
+                                global_bar=global_bar,
+                                global_tracker=global_tracker,
+                            )
                     finally:
                         rep.close()
                 else:
                     elapsed = 0.0
 
+                state_fallback_atoms: list[Atoms] | None = None
+                have_stage_traj = all(p.exists() for p in ts_files)
+                if run_name == "minimize" and not have_stage_traj and batch_state is not None:
+                    state_fallback_atoms = _state_to_atoms_list(batch_state, atoms_list)
+
                 for idx, (_item_idx, item) in enumerate(cohort):
                     ts_h5 = ts_files[idx]
                     flat_h5 = flat_files[idx]
                     thermo_csv = thermo_files[idx]
-                    pressure_for_export = float(item.pressure_MPa) if run_name == "retherm" else float(item.pressure_MPa)
-                    traj = _load_flat_traj_for_analysis(ts, ts_h5, flat_h5, pressure_for_export, config.timestep_ps)
-                    _write_thermo_csv(thermo_csv, traj)
-                    _export_thermo_from_torchsim(ts, ts_h5, rep_dirs[idx] / f"{run_name}_thermo_detailed.csv", config.timestep_ps * 1000.0)
-
-                    if run_name == "retherm":
-                        eq_start_idx = _select_equilibrated_start_idx(traj["density_g_cm3"])
-                        eq_slice = slice(eq_start_idx, None)
-                        vol_eq = np.asarray(traj["volume"][eq_slice], dtype=float)
-                        den_eq = np.asarray(traj["density_g_cm3"][eq_slice], dtype=float)
-                        retherm_summary = {
-                            "equilibration_start_index": int(eq_start_idx),
-                            "equilibration_start_step": int(traj["step"][eq_start_idx]),
-                            "equilibration_start_time_ps": float(traj["time_ps"][eq_start_idx]),
-                            "equilibrated_volume_mean_A3": float(np.mean(vol_eq)),
-                            "equilibrated_volume_std_A3": float(np.std(vol_eq)),
-                            "equilibrated_density_mean_g_cm3": float(np.mean(den_eq)),
-                            "equilibrated_density_std_g_cm3": float(np.std(den_eq)),
-                        }
-                        (rep_dirs[idx] / "retherm_equilibration.json").write_text(json.dumps(retherm_summary, indent=2), encoding="utf-8")
+                    if have_stage_traj:
+                        pressure_for_export = float(item.pressure_MPa)
+                        traj = _load_flat_traj_for_analysis(ts, ts_h5, flat_h5, pressure_for_export, config.timestep_ps)
+                        _write_thermo_csv(thermo_csv, traj)
+                        _export_thermo_from_torchsim(ts, ts_h5, rep_dirs[idx] / f"{run_name}_thermo_detailed.csv", config.timestep_ps * 1000.0)
 
                         atoms_next = atoms_list[idx].copy()
                         atoms_next.set_positions(np.asarray(traj["positions"][-1], dtype=float))
                         atoms_next.set_cell(np.asarray(traj["cell"][-1], dtype=float), scale_atoms=False)
-                        _set_atoms_volume_isotropic(atoms_next, float(retherm_summary["equilibrated_volume_mean_A3"]))
-                        start_atoms_by_condition[item.condition_id] = atoms_next
 
+                        if run_name == "retherm":
+                            eq_start_idx = _select_equilibrated_start_idx(traj["density_g_cm3"])
+                            eq_slice = slice(eq_start_idx, None)
+                            vol_eq = np.asarray(traj["volume"][eq_slice], dtype=float)
+                            den_eq = np.asarray(traj["density_g_cm3"][eq_slice], dtype=float)
+                            retherm_summary = {
+                                "equilibration_start_index": int(eq_start_idx),
+                                "equilibration_start_step": int(traj["step"][eq_start_idx]),
+                                "equilibration_start_time_ps": float(traj["time_ps"][eq_start_idx]),
+                                "equilibrated_volume_mean_A3": float(np.mean(vol_eq)),
+                                "equilibrated_volume_std_A3": float(np.std(vol_eq)),
+                                "equilibrated_density_mean_g_cm3": float(np.mean(den_eq)),
+                                "equilibrated_density_std_g_cm3": float(np.std(den_eq)),
+                            }
+                            (rep_dirs[idx] / "retherm_equilibration.json").write_text(json.dumps(retherm_summary, indent=2), encoding="utf-8")
+                            _set_atoms_volume_isotropic(atoms_next, float(retherm_summary["equilibrated_volume_mean_A3"]))
+
+                        start_atoms_by_condition[item.condition_id] = atoms_next
+                    elif state_fallback_atoms is not None and idx < len(state_fallback_atoms):
+                        start_atoms_by_condition[item.condition_id] = state_fallback_atoms[idx]
+
+                    prod_stage_index = production_stage_names.index(run_name) + 1 if run_name in production_stage_names else None
                     metadata = {
                         "condition_id": item.condition_id,
                         "phase": phase,
@@ -1026,15 +1354,21 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                         "ensemble_retherm": "npt",
                         "ensemble_production": "nvt",
                         "ensemble_requested": config.ensemble,
+                        "minimize_steps": int(config.minimize_steps),
+                        "heat_steps": int(config.heat_steps),
+                        "heat_start_temperature_k": float(config.heat_start_temperature_k),
+                        "stage_steps": int(nsteps),
                         "timestep_ps": config.timestep_ps,
                         "dump_every_steps": config.dump_every_steps,
                         "run_name": run_name,
+                        "production_stage_index": prod_stage_index,
+                        "production_stage_count": int(len(production_stage_names)),
                         "batch_group_size": len(cohort),
                         "batch_group_temperature_K": float(temp_k),
                         "batch_group_pressure_MPa": pressure_mpa,
                         "resume_used": bool(resume["resume_mode"]),
                         "run_elapsed_s": float(elapsed),
-                        "torchsim_trajectory": str(ts_h5),
+                        "torchsim_trajectory": str(ts_h5) if have_stage_traj else None,
                     }
                     (rep_dirs[idx] / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -1047,6 +1381,10 @@ def run_md_batches(items: list[StructureItem], config: ScreenConfig, phase: str)
                     steps_completed_runs=int(global_bar.n),
                     system_steps_completed=int(global_bar.n),
                 )
+
+        for item in items:
+            rep_dir = out_root / item.condition_id / f"replica_{replica:03d}"
+            _finalize_production_segments(rep_dir, production_stage_names)
 
     global_bar.set_postfix_str("completed")
     global_bar.close()
